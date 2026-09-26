@@ -4,9 +4,9 @@ from sentence_transformers import SentenceTransformer
 import google.generativeai as genai
 
 # Configuration de la page Streamlit
-st.set_page_config(page_title="Plateforme Normes LPEE - Enrobés", page_icon="🏗️", layout="wide")
+st.set_page_config(page_title="Plateforme Normes LPEE", page_icon="🏗️", layout="wide")
 
-st.title("🏗️ Assistant Technique LPEE - Spécial Enrobés & Compactage")
+st.title("🏗️ Assistant Technique et Normatif LPEE")
 st.markdown("Posez vos questions sur les guides techniques et normes LCPC/LPEE indexés.")
 
 # Configuration sécurisée de la clé API Gemini via Streamlit Secrets

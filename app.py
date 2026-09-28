@@ -25,18 +25,22 @@ from sentence_transformers import SentenceTransformer
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
 # --- Configuration de l'authentification ---
-# Identifiants par défaut modifiables (Mots de passe hachés bcrypt)
-# Exemples : admin / admin123 et agent / lpee2026
-names = ['Administrateur LPEE', 'Agent LPEE']
-usernames = ['admin', 'agent']
-passwords = [
-    '$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW',      '$2b$12$KixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lX'
-]
+# Structure des identifiants attendue par streamlit-authenticator
+credentials = {
+    "usernames": {
+        "admin": {
+            "name": "Administrateur LPEE",
+            "password": "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW" # Mot de passe : admin123
+        },
+        "agent": {
+            "name": "Agent LPEE",
+            "password": "$2b$12$KixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lX" # Mot de passe : lpee2026
+        }
+    }
+}
 
 authenticator = stauth.Authenticate(
-    names,
-    usernames,
-    passwords,
+    credentials,
     cookie_name='lpee_normes_cookie',
     key='lpee_signature_secret',
     cookie_expiry_days=30

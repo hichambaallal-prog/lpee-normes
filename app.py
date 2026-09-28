@@ -74,7 +74,7 @@ def appeler_gemini(prompt: str, max_output_tokens=None, modeles=None, essais_par
 
 
 def reformuler_question(question: str, historique: list) -> str:
-    """Transforme une question de suivi ("et per le GNA ?") en question autonome
+    """Transforme une question de suivi ("et pour le GNA ?") en question autonome
     et complète ("Quelle est l'exigence de teneur en eau pour une GNA ?"), en
     s'appuyant sur les derniers échanges — uniquement pour améliorer la RECHERCHE,
     la question affichée à l'agent reste inchangée."""
@@ -249,7 +249,7 @@ with st.sidebar:
     # Extraction des questions posées par l'utilisateur dans la session en cours
     questions_passees = [item["content"] for item in historique if item["role"] == "user"]
     if questions_passees:
-        for q in reversed(questions_passees[-10[] if len(questions_passees) > 10 else -len(questions_passees):]):
+        for q in reversed(questions_passees[-10:]):
             st.caption(f"• {q}")
     else:
         st.caption("Aucune question pour l'instant.")

@@ -1,5 +1,0 @@
-streamlit
-chromadb
-sentence-transformers
-google-generativeai
-pypdf

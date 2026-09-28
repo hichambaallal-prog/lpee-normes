@@ -13,6 +13,7 @@ Secrets requis (Streamlit Cloud > Settings > Secrets, format .toml) :
     SUPABASE_KEY = "..."
 """
 
+import os
 import time
 
 import streamlit as st
@@ -73,7 +74,7 @@ def appeler_gemini(prompt: str, max_output_tokens=None, modeles=None, essais_par
 
 
 def reformuler_question(question: str, historique: list) -> str:
-    """Transforme une question de suivi ("et pour le GNA ?") en question autonome
+    """Transforme une question de suivi ("et per le GNA ?") en question autonome
     et complète ("Quelle est l'exigence de teneur en eau pour une GNA ?"), en
     s'appuyant sur les derniers échanges — uniquement pour améliorer la RECHERCHE,
     la question affichée à l'agent reste inchangée."""
@@ -203,50 +204,95 @@ def afficher_sources(chunks: list, prefixe_cle: str):
                     st.error(f"PDF indisponible ({nom}) : {e}")
 
 
-# --- État de la conversation ---
-if "historique" not in st.session_state:
-    st.session_state.historique = []  # liste de {"role": "user"/"assistant", "content": str, "sources": list}
+# --- Gestion multi-conversations & historique ---
+if "sessions" not in st.session_state:
+    st.session_state.sessions = {"Conversation 1": []}
+if "session_courante" not in st.session_state:
+    st.session_state.session_courante = "Conversation 1"
 
-# --- Interface ---
+# Raccourci vers l'historique actif
+historique = st.session_state.sessions[st.session_state.session_courante]
+
+# --- Barre latérale (Sidebar) : Logo & Historique des recherches ---
+with st.sidebar:
+    # Affichage du logo LPEE s'il est présent au même niveau que app.py
+    if os.path.exists("logo lpee.jpg"):
+        st.image("logo lpee.jpg", use_container_width=True)
+    elif os.path.exists("logo_lpee.jpg"):
+        st.image("logo_lpee.jpg", use_container_width=True)
+    
+    st.header("🗂️ Historique & Sessions")
+    
+    if st.button("➕ Nouvelle conversation", use_container_width=True):
+        nb = len(st.session_state.sessions) + 1
+        nouvelle_cle = f"Conversation {nb}"
+        st.session_state.sessions[nouvelle_cle] = []
+        st.session_state.session_courante = nouvelle_cle
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("Mes conversations")
+    
+    # Sélecteur de session active
+    session_choisie = st.radio(
+        "Sélectionner une session",
+        list(st.session_state.sessions.keys()),
+        index=list(st.session_state.sessions.keys()).index(st.session_state.session_courante),
+        label_visibility="collapsed"
+    )
+    if session_choisie != st.session_state.session_courante:
+        st.session_state.session_courante = session_choisie
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("### 🔍 Recherches récentes (Session active)")
+    # Extraction des questions posées par l'utilisateur dans la session en cours
+    questions_passees = [item["content"] for item in historique if item["role"] == "user"]
+    if questions_passees:
+        for q in reversed(questions_passees[-10[] if len(questions_passees) > 10 else -len(questions_passees):]):
+            st.caption(f"• {q}")
+    else:
+        st.caption("Aucune question pour l'instant.")
+
+# --- Interface Principale ---
 st.title("📚 Recherche des normes et fascicules techniques — LPEE")
-st.caption("Discutez avec l'assistant : posez une question, puis enchaînez des questions de suivi si besoin.")
+st.caption(f"Session active : **{st.session_state.session_courante}** — Posez une question, puis enchaînez des questions de suivi si besoin.")
 
 col_titre, col_bouton = st.columns([5, 1])
 with col_bouton:
-    if st.button("🗑️ Nouvelle conversation", use_container_width=True):
-        st.session_state.historique = []
+    if st.button("🗑️ Vider", use_container_width=True):
+        st.session_state.sessions[st.session_state.session_courante] = []
         st.rerun()
 
-# Affiche tout l'historique
-for idx, echange in enumerate(st.session_state.historique):
+# Affiche tout l'historique de la conversation active
+for idx, echange in enumerate(historique):
     with st.chat_message("user" if echange["role"] == "user" else "assistant"):
         st.markdown(echange["content"])
         if echange["role"] == "assistant" and echange.get("sources"):
-            afficher_sources(echange["sources"], prefixe_cle=f"msg{idx}")
+            afficher_sources(echange["sources"], prefixe_cle=f"{st.session_state.session_courante}_msg{idx}")
 
 # Zone de saisie de la nouvelle question, en bas de page (comportement chat classique)
 question = st.chat_input("Posez votre question ou enchaînez sur la précédente...")
 
 if question:
-    st.session_state.historique.append({"role": "user", "content": question})
+    historique.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
         with st.spinner("Recherche dans les documents indexés..."):
-            question_recherche = reformuler_question(question, st.session_state.historique[:-1])
+            question_recherche = reformuler_question(question, historique[:-1])
             chunks = rechercher_chunks(question_recherche)
 
         if not chunks:
             reponse = "Aucun document pertinent trouvé pour cette question. Reformulez-la, ou vérifiez que l'indexation a bien été exécutée."
             st.markdown(reponse)
-            st.session_state.historique.append({"role": "assistant", "content": reponse, "sources": []})
+            historique.append({"role": "assistant", "content": reponse, "sources": []})
         else:
             with st.spinner("Génération de la réponse..."):
-                reponse = generer_reponse(question, chunks, st.session_state.historique[:-1])
+                reponse = generer_reponse(question, chunks, historique[:-1])
 
             st.markdown(reponse)
-            # Même préfixe de clé que celui utilisé plus tard par l'historique (index du message assistant)
-            afficher_sources(chunks, prefixe_cle=f"msg{len(st.session_state.historique)}")
+            afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
 
-            st.session_state.historique.append({"role": "assistant", "content": reponse, "sources": chunks})
+            historique.append({"role": "assistant", "content": reponse, "sources": chunks})

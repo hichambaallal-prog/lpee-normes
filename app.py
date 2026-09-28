@@ -23,7 +23,7 @@ from sentence_transformers import SentenceTransformer
 
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
-# --- Authentification simple et directe ---
+# --- Authentification multi-utilisateurs simple ---
 if "authentifie" not in st.session_state:
     st.session_state.authentifie = False
     st.session_state.nom_utilisateur = ""
@@ -33,12 +33,12 @@ if not st.session_state.authentifie:
     st.markdown("Veuillez vous identifier pour accéder aux normes et fascicules techniques.")
     
     with st.form("form_login"):
-        username_input = st.text_input("Nom d'utilisateur (ex: admin)")
-        password_input = st.text_input("Mot de passe (ex: admin123)", type="password")
+        username_input = st.text_input("Nom d'utilisateur")
+        password_input = st.text_input("Mot de passe", type="password")
         submit_login = st.form_submit_button("Se connecter")
         
         if submit_login:
-            # Identifiants valides
+            # Comptes autorisés (Vous pouvez en ajouter facilement ici)
             if username_input == "admin" and password_input == "admin123":
                 st.session_state.authentifie = True
                 st.session_state.nom_utilisateur = "Administrateur LPEE"
@@ -46,6 +46,10 @@ if not st.session_state.authentifie:
             elif username_input == "agent" and password_input == "lpee2026":
                 st.session_state.authentifie = True
                 st.session_state.nom_utilisateur = "Agent LPEE"
+                st.rerun()
+            elif username_input == "ingenieur" and password_input == "pass123":
+                st.session_state.authentifie = True
+                st.session_state.nom_utilisateur = "Ingénieur LPEE"
                 st.rerun()
             else:
                 st.error("Nom d'utilisateur ou mot de passe incorrect.")

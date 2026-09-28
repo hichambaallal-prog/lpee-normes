@@ -24,36 +24,37 @@ from sentence_transformers import SentenceTransformer
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
 # ==========================================
-# GESTION DES LOGINS ET MOTS DE PASSE DES AGENTS
+# GESTION DES UTILISATEURS (STOCKAGE EN SESSION)
 # ==========================================
-# Vous pouvez ajouter, modifier ou supprimer des comptes facilement ci-dessous :
-# "nom_utilisateur": ("Mot de passe", "Nom complet affiché")
-UTILISATEURS_AUTORISES = {
-    "admin": ("admin123", "Administrateur LPEE"),
-    "agent1": ("lpee2026", "Agent Laboratoire Béton"),
-    "agent2": ("lpee2026", "Agent Laboratoire Sols"),
-    "ingenieur": ("pass123", "Ingénieur d'État"),
-    # Ajoutez d'autres agents ici au besoin :
-    # "username": ("mot_de_passe", "Nom ou rôle de l'agent")
-}
+if "utilisateurs" not in st.session_state:
+    st.session_state.utilisateurs = {
+        "admin": {"password": "admin123", "nom": "Administrateur LPEE", "role": "admin"},
+        "agent1": {"password": "lpee2026", "nom": "Agent Laboratoire Béton", "role": "agent"},
+        "agent2": {"password": "lpee2026", "nom": "Agent Laboratoire Sols", "role": "agent"}
+    }
 
 if "authentifie" not in st.session_state:
     st.session_state.authentifie = False
+    st.session_state.username_courant = ""
     st.session_state.nom_utilisateur = ""
+    st.session_state.role_utilisateur = ""
 
+# --- ÉCRAN DE CONNEXION ---
 if not st.session_state.authentifie:
     st.title("🔐 Connexion — Plateforme LPEE")
     st.markdown("Veuillez vous identifier pour accéder aux normes et fascicules techniques.")
     
     with st.form("form_login"):
-        username_input = st.text_input("Nom d'utilisateur").strip()
+        username_input = st.text_input("Nom d'utilisateur").strip().lower()
         password_input = st.text_input("Mot de passe", type="password")
         submit_login = st.form_submit_button("Se connecter")
         
         if submit_login:
-            if username_input in UTILISATEURS_AUTORISES and UTILISATEURS_AUTORISES[username_input][0] == password_input:
+            if username_input in st.session_state.utilisateurs and st.session_state.utilisateurs[username_input]["password"] == password_input:
                 st.session_state.authentifie = True
-                st.session_state.nom_utilisateur = UTILISATEURS_AUTORISES[username_input][1]
+                st.session_state.username_courant = username_input
+                st.session_state.nom_utilisateur = st.session_state.utilisateurs[username_input]["nom"]
+                st.session_state.role_utilisateur = st.session_state.utilisateurs[username_input]["role"]
                 st.rerun()
             else:
                 st.error("Nom d'utilisateur ou mot de passe incorrect.")
@@ -65,15 +66,13 @@ if not st.session_state.authentifie:
 # ==========================================
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"  # DOIT être le même modèle que dans ingest.py
-# Modèles essayés dans l'ordre : si le premier est saturé (erreur 503), on bascule sur le suivant.
-# Un nom inexistant chez vous est simplement ignoré (le suivant est essayé), sans faire planter l'appli.
 MODELES_GENERATION = [
-    "gemini-flash-latest",        # modèle principal
-    "gemini-flash-lite-latest",   # secours 1 : plus léger, moins souvent saturé
-    "gemini-2.5-flash",           # secours 2
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
 ]
-NB_RESULTATS = 25  # + de chunks récupérés = réponses plus riches/complètes (au prix d'un peu de vitesse)
-NB_ECHANGES_CONTEXTE = 4  # nb de questions/réponses précédentes gardées comme contexte de conversation
+NB_RESULTATS = 25
+NB_ECHANGES_CONTEXTE = 4
 
 client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
@@ -91,14 +90,11 @@ def embed_texte(texte: str, prefixe: str):
 
 
 def _erreur_temporaire(e) -> bool:
-    """Erreurs côté Google qui se résolvent d'elles-mêmes (surcharge, quota par minute...)."""
     msg = str(e)
     return any(m in msg for m in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "504", "INTERNAL", "DEADLINE"))
 
 
 def appeler_gemini(prompt: str, max_output_tokens=None, modeles=None, essais_par_modele=2, attente=5):
-    """Appelle Gemini. En cas de surcharge temporaire, réessaie après une pause, puis bascule
-    sur le modèle suivant de la liste. Retourne la réponse, ou lève la dernière erreur si tout échoue."""
     config = {"max_output_tokens": max_output_tokens} if max_output_tokens else None
     derniere_erreur = None
     for modele in (modeles or MODELES_GENERATION):
@@ -110,15 +106,11 @@ def appeler_gemini(prompt: str, max_output_tokens=None, modeles=None, essais_par
                 if _erreur_temporaire(e) and essai < essais_par_modele - 1:
                     time.sleep(attente * (essai + 1))
                     continue
-                break  # erreur non temporaire (ex: nom de modèle inconnu) ou essais épuisés -> modèle suivant
+                break
     raise derniere_erreur
 
 
 def reformuler_question(question: str, historique: list) -> str:
-    """Transforme une question de suivi ("et pour le GNA ?") en question autonome
-    et complète ("Quelle est l'exigence de teneur en eau pour une GNA ?"), en
-    s'appuyant sur les derniers échanges — uniquement pour améliorer la RECHERCHE,
-    la question affichée à l'agent reste inchangée."""
     if not historique:
         return question
 
@@ -138,7 +130,7 @@ Ne réponds pas à la question, donne UNIQUEMENT la question reformulée, sans g
         reformulee = (resp.text or "").strip()
         return reformulee if reformulee else question
     except Exception:
-        return question  # en cas d'erreur, on retombe sur la question telle quelle
+        return question
 
 
 def rechercher_chunks(question: str, k=NB_RESULTATS):
@@ -187,7 +179,6 @@ Réponse (complète, détaillée, structurée, avec citations des sources) :"""
 
     if resp.text:
         return resp.text
-    # Réponse vide (souvent un blocage par les filtres de sécurité Gemini)
     motif = getattr(resp.candidates[0], "finish_reason", None) if resp.candidates else None
     return f"⚠️ Le modèle n'a renvoyé aucun texte (motif : {motif}). Reformulez la question et réessayez."
 
@@ -199,7 +190,6 @@ HF_TOKEN = st.secrets.get("HF_TOKEN", "")
 
 @st.cache_data(show_spinner="Récupération du PDF...", max_entries=5)
 def telecharger_pdf(chemin_relatif: str) -> bytes:
-    """Télécharge un PDF depuis le dépôt privé Hugging Face (à la demande seulement)."""
     from huggingface_hub import hf_hub_download
     chemin_local = hf_hub_download(
         repo_id=HF_REPO_ID,
@@ -220,7 +210,7 @@ def afficher_sources(chunks: list, prefixe_cle: str):
             st.divider()
 
     if not (HF_REPO_ID and HF_TOKEN):
-        return  # téléchargement non configuré : on n'affiche que les extraits
+        return
 
     fichiers_uniques = {}
     for c in chunks:
@@ -251,12 +241,10 @@ if "sessions" not in st.session_state:
 if "session_courante" not in st.session_state:
     st.session_state.session_courante = "Conversation 1"
 
-# Raccourci vers l'historique actif
 historique = st.session_state.sessions[st.session_state.session_courante]
 
-# --- Barre latérale (Sidebar) : Logo, Déconnexion & Historique des recherches ---
+# --- Barre latérale (Sidebar) ---
 with st.sidebar:
-    # Affichage du logo LPEE s'il est présent au même niveau que app.py
     if os.path.exists("logo lpee.jpg"):
         st.image("logo lpee.jpg", use_container_width=True)
     elif os.path.exists("logo_lpee.jpg"):
@@ -268,6 +256,65 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
+
+    # --- Section Gestion des Utilisateurs (Visible uniquement pour l'admin) ---
+    if st.session_state.role_utilisateur == "admin":
+        with st.expander("👥 Gestion des Utilisateurs"):
+            action_user = st.radio("Action", ["Ajouter", "Modifier / Supprimer"], label_visibility="collapsed")
+            
+            if action_user == "Ajouter":
+                st.subheader("Nouvel agent")
+                n_user = st.text_input("Identifiant (login)").strip().lower()
+                n_pass = st.text_input("Mot de passe", type="password")
+                n_nom = st.text_input("Nom complet / Rôle")
+                n_role = st.selectbox("Rôle", ["agent", "admin"])
+                
+                if st.button("Enregistrer l'agent", use_container_width=True):
+                    if n_user and n_pass and n_nom:
+                        if n_user in st.session_state.utilisateurs:
+                            st.error("Cet identifiant existe déjà.")
+                        else:
+                            st.session_state.utilisateurs[n_user] = {
+                                "password": n_pass,
+                                "nom": n_nom,
+                                "role": n_role
+                            }
+                            st.success(f"Agent {n_nom} ajouté avec succès !")
+                            time.sleep(1)
+                            st.rerun()
+                    else:
+                        st.warning("Veuillez remplir tous les champs.")
+            
+            else:
+                st.subheader("Modifier ou Supprimer")
+                liste_logins = list(st.session_state.utilisateurs.keys())
+                sel_user = st.selectbox("Choisir un utilisateur", liste_logins)
+                
+                if sel_user:
+                    mod_nom = st.text_input("Nom complet", value=st.session_state.utilisateurs[sel_user]["nom"])
+                    mod_pass = st.text_input("Nouveau mot de passe", value=st.session_state.utilisateurs[sel_user]["password"], type="password")
+                    mod_role = st.selectbox("Rôle", ["agent", "admin"], index=0 if st.session_state.utilisateurs[sel_user]["role"] == "agent" else 1)
+                    
+                    col_m1, col_m2 = st.columns(2)
+                    with col_m1:
+                        if st.button("Mettre à jour", use_container_width=True):
+                            st.session_state.utilisateurs[sel_user]["nom"] = mod_nom
+                            st.session_state.utilisateurs[sel_user]["password"] = mod_pass
+                            st.session_state.utilisateurs[sel_user]["role"] = mod_role
+                            st.success("Modifications enregistrées !")
+                            time.sleep(1)
+                            st.rerun()
+                    with col_m2:
+                        if sel_user != "admin": # Empêcher de supprimer l'admin principal par défaut
+                            if st.button("Supprimer", use_container_width=True, type="primary"):
+                                del st.session_state.utilisateurs[sel_user]
+                                st.success("Utilisateur supprimé.")
+                                time.sleep(1)
+                                st.rerun()
+                        else:
+                            st.caption("Admin principal indésentourable.")
+
+        st.markdown("---")
 
     st.header("🗂️ Historique & Sessions")
     
@@ -281,7 +328,6 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Mes conversations")
     
-    # Sélecteur de session active
     session_choisie = st.radio(
         "Sélectionner une session",
         list(st.session_state.sessions.keys()),
@@ -294,7 +340,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 🔍 Recherches récentes (Session active)")
-    # Extraction des questions posées par l'utilisateur dans la session en cours
     questions_passees = [item["content"] for item in historique if item["role"] == "user"]
     if questions_passees:
         for q in reversed(questions_passees[-10:]):
@@ -312,14 +357,12 @@ with col_bouton:
         st.session_state.sessions[st.session_state.session_courante] = []
         st.rerun()
 
-# Affiche tout l'historique de la conversation active
 for idx, echange in enumerate(historique):
     with st.chat_message("user" if echange["role"] == "user" else "assistant"):
         st.markdown(echange["content"])
         if echange["role"] == "assistant" and echange.get("sources"):
             afficher_sources(echange["sources"], prefixe_cle=f"{st.session_state.session_courante}_msg{idx}")
 
-# Zone de saisie de la nouvelle question, en bas de page (comportement chat classique)
 question = st.chat_input("Posez votre question ou enchaînez sur la précédente...")
 
 if question:

@@ -1,0 +1,5 @@
+.env
+.streamlit/
+*.pdf
+ingest_manifest.json
+__pycache__/

@@ -19,6 +19,7 @@ import time
 import streamlit as st
 from supabase import create_client
 from google import genai
+from google.genai import types
 from sentence_transformers import SentenceTransformer
 
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
@@ -70,11 +71,15 @@ if not st.session_state.authentifie:
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"  # DOIT être le même modèle que dans ingest.py
 MODELES_GENERATION = [
+    "gemini-2.5-flash",          # rapide + précis (réflexion désactivée => réponse immédiate)
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
-    "gemini-2.5-flash",
 ]
-NB_RESULTATS = 25
+MODELE_REFORMULATION = "gemini-flash-lite-latest"
+NB_CANDIDATS = 30          # extraits récupérés dans la base
+NB_MIN_RESULTATS = 8       # minimum gardé même si la pertinence est faible
+NB_MAX_RESULTATS = 20      # maximum envoyé au modèle (prompt plus court = réponse plus rapide)
+ECART_PERTINENCE = 0.08    # on écarte les extraits trop éloignés du meilleur score
 NB_ECHANGES_CONTEXTE = 4
 
 client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
@@ -97,93 +102,132 @@ def _erreur_temporaire(e) -> bool:
     return any(m in msg for m in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "504", "INTERNAL", "DEADLINE"))
 
 
-def appeler_gemini(prompt: str, max_output_tokens=None, modeles=None, essais_par_modele=2, attente=5):
-    config = {"max_output_tokens": max_output_tokens} if max_output_tokens else None
-    derniere_erreur = None
-    for modele in (modeles or MODELES_GENERATION):
-        for essai in range(essais_par_modele):
-            try:
-                return client.models.generate_content(model=modele, contents=prompt, config=config)
-            except Exception as e:
-                derniere_erreur = e
-                if _erreur_temporaire(e) and essai < essais_par_modele - 1:
-                    time.sleep(attente * (essai + 1))
-                    continue
-                break
-    raise derniere_erreur
+def _config(max_output_tokens, modele, temperature=0.1):
+    """Température basse = réponses factuelles ; réflexion désactivée sur 2.5 = beaucoup plus rapide."""
+    cfg = {"temperature": temperature}
+    if max_output_tokens:
+        cfg["max_output_tokens"] = max_output_tokens
+    if "2.5" in modele:
+        cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+    return types.GenerateContentConfig(**cfg)
 
 
 def reformuler_question(question: str, historique: list) -> str:
+    """Rend la question autonome. Sautée quand ce n'est pas nécessaire (gain de 1 à 3 s)."""
     if not historique:
         return question
+    mots = question.split()
+    debut = question.lower().lstrip().split(" ")[0]
+    if len(mots) >= 8 and debut not in ("et", "pour", "aussi", "alors", "donc", "mais", "même"):
+        return question  # question déjà complète
 
     derniers = historique[-NB_ECHANGES_CONTEXTE:]
-    fil = "\n".join(f"{'Agent' if h['role'] == 'user' else 'Assistant'} : {h['content']}" for h in derniers)
-    prompt = f"""Voici le début d'une conversation technique entre un agent LPEE et un assistant documentaire :
+    fil = "\n".join(f"{'Agent' if h['role'] == 'user' else 'Assistant'} : {h['content'][:600]}" for h in derniers)
+    prompt = f"""Conversation technique entre un agent LPEE et un assistant documentaire :
 
 {fil}
 
-Nouvelle question de l'agent : "{question}"
+Nouvelle question : "{question}"
 
-Reformule cette nouvelle question en une question AUTONOME et COMPLÈTE, compréhensible sans le
-reste de la conversation (remplace "il", "ça", "et pour X" etc. par ce à quoi ça fait référence).
-Ne réponds pas à la question, donne UNIQUEMENT la question reformulée, sans guillemets ni commentaire."""
+Reformule cette question en une question AUTONOME et COMPLÈTE (remplace "il", "ça", "et pour X"...).
+Réponds UNIQUEMENT par la question reformulée, sans guillemets ni commentaire."""
     try:
-        resp = appeler_gemini(prompt, modeles=MODELES_GENERATION[:2], essais_par_modele=1)
-        reformulee = (resp.text or "").strip()
-        return reformulee if reformulee else question
+        resp = client.models.generate_content(
+            model=MODELE_REFORMULATION, contents=prompt, config=_config(120, MODELE_REFORMULATION, 0.0)
+        )
+        return (resp.text or "").strip() or question
     except Exception:
         return question
 
 
-def rechercher_chunks(question: str, k=NB_RESULTATS):
+@st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
+def rechercher_chunks(question: str):
+    """Recherche vectorielle (mise en cache) + filtrage par pertinence + tri par document/page."""
     vecteur = embed_texte(question, prefixe="query")
     res = supabase.rpc("match_documents", {
         "query_embedding": vecteur,
-        "match_count": k,
+        "match_count": NB_CANDIDATS,
     }).execute()
-    return res.data or []
+    candidats = sorted(res.data or [], key=lambda c: c["similarity"], reverse=True)
+    if not candidats:
+        return []
+
+    meilleur = candidats[0]["similarity"]
+    gardes, vus = [], set()
+    for c in candidats:
+        cle = (c["metadata"].get("fichier"), c["metadata"].get("page"), c["content"][:120])
+        if cle in vus:
+            continue  # doublon
+        vus.add(cle)
+        if len(gardes) < NB_MIN_RESULTATS or c["similarity"] >= meilleur - ECART_PERTINENCE:
+            gardes.append(c)
+        if len(gardes) >= NB_MAX_RESULTATS:
+            break
+
+    # Regroupe par document puis page : le modèle lit un texte plus cohérent
+    gardes.sort(key=lambda c: (str(c["metadata"].get("fichier")), c["metadata"].get("page") or 0))
+    return gardes
 
 
-def generer_reponse(question: str, chunks: list, historique: list):
+def construire_prompt(question: str, chunks: list, historique: list) -> str:
     contexte_docs = "\n\n---\n\n".join(
         f"[Source {i+1} — {c['metadata'].get('fichier')}, page {c['metadata'].get('page')}]\n{c['content']}"
         for i, c in enumerate(chunks)
     )
-
     derniers = historique[-NB_ECHANGES_CONTEXTE:]
-    fil_conversation = "\n".join(f"{'Agent' if h['role'] == 'user' else 'Assistant'} : {h['content']}" for h in derniers)
-    bloc_historique = f"\nDébut de la conversation (pour le contexte) :\n{fil_conversation}\n" if derniers else ""
+    fil = "\n".join(f"{'Agent' if h['role'] == 'user' else 'Assistant'} : {h['content'][:600]}" for h in derniers)
+    bloc_historique = f"\nContexte de la conversation :\n{fil}\n" if derniers else ""
 
-    prompt = f"""Tu es un assistant technique pour les agents du LPEE (laboratoire d'essais de matériaux et travaux publics).
-Réponds à la question de façon COMPLÈTE et DÉTAILLÉE, en t'appuyant sur TOUS les extraits pertinents fournis
-ci-dessous (ne te limite pas au premier extrait venu : croise et synthétise l'information de plusieurs sources
-quand elles se complètent). Structure ta réponse avec des sections/puces si le sujet s'y prête.
-Réponds UNIQUEMENT à partir de ces extraits. Si un point précis n'est pas couvert par les extraits, dis-le
-clairement plutôt que d'inventer, plutôt que de raccourcir artificiellement la réponse.
-Cite systématiquement le document et la page source de chaque affirmation, au format (Source X).
+    return f"""Tu es un assistant technique pour les agents du LPEE (laboratoire d'essais de matériaux et travaux publics).
+
+RÈGLES DE PRÉCISION (impératives) :
+1. Réponds UNIQUEMENT à partir des extraits ci-dessous. N'utilise aucune connaissance extérieure.
+2. Sois EXHAUSTIF : croise tous les extraits pertinents et fusionne ceux qui se complètent.
+3. Reprends FIDÈLEMENT les valeurs chiffrées, unités, seuils, tolérances, formules, références de normes
+   (ex. NF EN, NM, ASTM), numéros d'articles/paragraphes et conditions d'essai, exactement comme écrits.
+   Ne les arrondis pas, ne les convertis pas.
+4. Si des extraits se contredisent (versions/normes différentes), signale-le et cite chaque source.
+5. Cite chaque affirmation avec (Source X) — fichier et page.
+6. Termine par une section « Points non couverts » listant ce que les extraits ne permettent pas de confirmer.
+   Ne devine jamais.
+
+FORMAT : commence directement par la réponse (pas d'introduction), puis sections courtes avec puces ;
+tableau si tu compares des valeurs ; en dernier, « Points non couverts ».
 {bloc_historique}
-Extraits disponibles pour cette nouvelle question :
+EXTRAITS :
 {contexte_docs}
 
-Question de l'agent : {question}
+QUESTION : {question}
 
-Réponse (complète, détaillée, structurée, avec citations des sources) :"""
+RÉPONSE :"""
 
-    try:
-        resp = appeler_gemini(prompt, max_output_tokens=4096)
-    except Exception as e:
-        return (
-            "⚠️ Le service Gemini est momentanément saturé (problème côté Google, pas côté application). "
-            "Les documents trouvés pour votre question sont listés ci-dessous : vous pouvez les consulter "
-            "ou les télécharger dès maintenant, puis reposer la question dans une minute.\n\n"
-            f"Détail technique : `{e}`"
-        )
 
-    if resp.text:
-        return resp.text
-    motif = getattr(resp.candidates[0], "finish_reason", None) if resp.candidates else None
-    return f"⚠️ Le modèle n'a renvoyé aucun texte (motif : {motif}). Reformulez la question et réessayez."
+def flux_reponse(prompt: str):
+    """Générateur : affiche la réponse au fur et à mesure (1er mot en ~1 s) avec repli automatique de modèle."""
+    derniere_erreur = None
+    for modele in MODELES_GENERATION:
+        emis = False
+        try:
+            for morceau in client.models.generate_content_stream(
+                model=modele, contents=prompt, config=_config(4096, modele)
+            ):
+                if morceau.text:
+                    emis = True
+                    yield morceau.text
+            if emis:
+                return
+        except Exception as e:
+            derniere_erreur = e
+            if emis:
+                yield "\n\n⚠️ Réponse interrompue (saturation du service). Reposez la question pour la compléter."
+                return
+            if _erreur_temporaire(e):
+                time.sleep(2)
+    yield (
+        "⚠️ Le service Gemini est momentanément saturé (côté Google). Les documents trouvés sont listés "
+        "ci-dessous ; réessayez dans une minute.\n\n"
+        f"Détail technique : `{derniere_erreur}`"
+    )
 
 
 # --- Téléchargement des PDF originaux (dépôt Hugging Face privé, gratuit) ---
@@ -206,9 +250,9 @@ def telecharger_pdf(chemin_relatif: str) -> bytes:
 
 def afficher_sources(chunks: list, prefixe_cle: str):
     with st.expander("📎 Sources utilisées"):
-        for c in chunks:
+        for i, c in enumerate(chunks, 1):
             meta = c["metadata"]
-            st.markdown(f"**{meta.get('fichier')}** — page {meta.get('page')} (pertinence : {c['similarity']:.0%})")
+            st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} (pertinence : {c['similarity']:.0%})")
             st.caption(c["content"])
             st.divider()
 
@@ -386,10 +430,7 @@ if question:
             st.markdown(reponse)
             historique.append({"role": "assistant", "content": reponse, "sources": []})
         else:
-            with st.spinner("Génération de la réponse..."):
-                reponse = generer_reponse(question, chunks, historique[:-1])
-
-            st.markdown(reponse)
+            prompt = construire_prompt(question, chunks, historique[:-1])
+            reponse = st.write_stream(flux_reponse(prompt))  # affichage progressif
             afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
-
             historique.append({"role": "assistant", "content": reponse, "sources": chunks})

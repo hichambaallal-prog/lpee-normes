@@ -23,7 +23,13 @@ from sentence_transformers import SentenceTransformer
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"  # DOIT être le même modèle que dans ingest.py
-GENERATION_MODEL = "gemini-flash-latest"  # vérifiez le nom exact disponible dans votre AI Studio
+# Modèles essayés dans l'ordre : si le premier est saturé (erreur 503), on bascule sur le suivant.
+# Un nom inexistant chez vous est simplement ignoré (le suivant est essayé), sans faire planter l'appli.
+MODELES_GENERATION = [
+    "gemini-flash-latest",        # modèle principal
+    "gemini-flash-lite-latest",   # secours 1 : plus léger, moins souvent saturé
+    "gemini-2.5-flash",           # secours 2
+]
 NB_RESULTATS = 25  # + de chunks récupérés = réponses plus riches/complètes (au prix d'un peu de vitesse)
 NB_ECHANGES_CONTEXTE = 4  # nb de questions/réponses précédentes gardées comme contexte de conversation
 
@@ -40,6 +46,30 @@ def embed_texte(texte: str, prefixe: str):
     modele = charger_modele()
     vecteur = modele.encode([f"{prefixe}: {texte}"], normalize_embeddings=True, show_progress_bar=False)
     return vecteur[0].tolist()
+
+
+def _erreur_temporaire(e) -> bool:
+    """Erreurs côté Google qui se résolvent d'elles-mêmes (surcharge, quota par minute...)."""
+    msg = str(e)
+    return any(m in msg for m in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "504", "INTERNAL", "DEADLINE"))
+
+
+def appeler_gemini(prompt: str, max_output_tokens=None, modeles=None, essais_par_modele=2, attente=5):
+    """Appelle Gemini. En cas de surcharge temporaire, réessaie après une pause, puis bascule
+    sur le modèle suivant de la liste. Retourne la réponse, ou lève la dernière erreur si tout échoue."""
+    config = {"max_output_tokens": max_output_tokens} if max_output_tokens else None
+    derniere_erreur = None
+    for modele in (modeles or MODELES_GENERATION):
+        for essai in range(essais_par_modele):
+            try:
+                return client.models.generate_content(model=modele, contents=prompt, config=config)
+            except Exception as e:
+                derniere_erreur = e
+                if _erreur_temporaire(e) and essai < essais_par_modele - 1:
+                    time.sleep(attente * (essai + 1))
+                    continue
+                break  # erreur non temporaire (ex: nom de modèle inconnu) ou essais épuisés -> modèle suivant
+    raise derniere_erreur
 
 
 def reformuler_question(question: str, historique: list) -> str:
@@ -62,7 +92,7 @@ Reformule cette nouvelle question en une question AUTONOME et COMPLÈTE, compré
 reste de la conversation (remplace "il", "ça", "et pour X" etc. par ce à quoi ça fait référence).
 Ne réponds pas à la question, donne UNIQUEMENT la question reformulée, sans guillemets ni commentaire."""
     try:
-        resp = client.models.generate_content(model=GENERATION_MODEL, contents=prompt)
+        resp = appeler_gemini(prompt, modeles=MODELES_GENERATION[:2], essais_par_modele=1)
         reformulee = (resp.text or "").strip()
         return reformulee if reformulee else question
     except Exception:
@@ -103,27 +133,21 @@ Question de l'agent : {question}
 
 Réponse (complète, détaillée, structurée, avec citations des sources) :"""
 
-    derniere_erreur = None
-    for tentative in range(3):
-        try:
-            resp = client.models.generate_content(
-                model=GENERATION_MODEL,
-                contents=prompt,
-                config={"max_output_tokens": 4096},
-            )
-            if resp.text:
-                return resp.text
-            # Réponse vide (souvent un blocage par les filtres de sécurité Gemini) : pas la peine de réessayer.
-            motif = getattr(resp, "prompt_feedback", None) or getattr(resp.candidates[0], "finish_reason", None) if resp.candidates else None
-            return f"⚠️ Le modèle n'a renvoyé aucun texte (motif : {motif}). Reformulez la question et réessayez."
-        except Exception as e:
-            derniere_erreur = e
-            time.sleep(2 * (tentative + 1))
+    try:
+        resp = appeler_gemini(prompt, max_output_tokens=4096)
+    except Exception as e:
+        return (
+            "⚠️ Le service Gemini est momentanément saturé (problème côté Google, pas côté application). "
+            "Les documents trouvés pour votre question sont listés ci-dessous : vous pouvez les consulter "
+            "ou les télécharger dès maintenant, puis reposer la question dans une minute.\n\n"
+            f"Détail technique : `{e}`"
+        )
 
-    return (
-        "⚠️ Erreur du serveur Gemini après plusieurs tentatives — réessayez dans quelques instants.\n\n"
-        f"Détail technique : `{derniere_erreur}`"
-    )
+    if resp.text:
+        return resp.text
+    # Réponse vide (souvent un blocage par les filtres de sécurité Gemini)
+    motif = getattr(resp.candidates[0], "finish_reason", None) if resp.candidates else None
+    return f"⚠️ Le modèle n'a renvoyé aucun texte (motif : {motif}). Reformulez la question et réessayez."
 
 
 # --- Téléchargement des PDF originaux (dépôt Hugging Face privé, gratuit) ---

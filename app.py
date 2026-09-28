@@ -35,8 +35,11 @@ if "utilisateurs" not in st.session_state:
 
 if "authentifie" not in st.session_state:
     st.session_state.authentifie = False
+if "username_courant" not in st.session_state:
     st.session_state.username_courant = ""
+if "nom_utilisateur" not in st.session_state:
     st.session_state.nom_utilisateur = ""
+if "role_utilisateur" not in st.session_state:
     st.session_state.role_utilisateur = ""
 
 # --- ÉCRAN DE CONNEXION ---
@@ -253,12 +256,15 @@ with st.sidebar:
     st.write(f"Connecté : **{st.session_state.nom_utilisateur}**")
     if st.button("🚪 Déconnexion", use_container_width=True):
         st.session_state.authentifie = False
+        st.session_state.username_courant = ""
+        st.session_state.nom_utilisateur = ""
+        st.session_state.role_utilisateur = ""
         st.rerun()
 
     st.markdown("---")
 
     # --- Section Gestion des Utilisateurs (Visible uniquement pour l'admin) ---
-    if st.session_state.role_utilisateur == "admin":
+    if st.session_state.get("role_utilisateur") == "admin":
         with st.expander("👥 Gestion des Utilisateurs"):
             action_user = st.radio("Action", ["Ajouter", "Modifier / Supprimer"], label_visibility="collapsed")
             
@@ -305,14 +311,14 @@ with st.sidebar:
                             time.sleep(1)
                             st.rerun()
                     with col_m2:
-                        if sel_user != "admin": # Empêcher de supprimer l'admin principal par défaut
+                        if sel_user != "admin":
                             if st.button("Supprimer", use_container_width=True, type="primary"):
                                 del st.session_state.utilisateurs[sel_user]
                                 st.success("Utilisateur supprimé.")
                                 time.sleep(1)
                                 st.rerun()
                         else:
-                            st.caption("Admin principal indésentourable.")
+                            st.caption("Admin principal non supprimable.")
 
         st.markdown("---")
 

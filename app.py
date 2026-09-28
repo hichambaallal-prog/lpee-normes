@@ -4,7 +4,16 @@ Plateforme de recherche des normes et fascicules techniques — LPEE
 Interface de type "chat" avec historique : les agents peuvent poser une
 question, puis enchaîner des questions de suivi ("et pour le GNA ?") qui
 tiennent compte de la conversation précédente.
+
+À déployer sur Streamlit Community Cloud (gratuit), connecté à Supabase.
+
+Secrets requis (Streamlit Cloud > Settings > Secrets, format .toml) :
+    GOOGLE_API_KEY = "..."
+    SUPABASE_URL = "..."
+    SUPABASE_KEY = "..."
 """
+
+import time
 
 import streamlit as st
 from supabase import create_client
@@ -14,9 +23,9 @@ from sentence_transformers import SentenceTransformer
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"  # DOIT être le même modèle que dans ingest.py
-GENERATION_MODEL = "gemini-2.5-flash"  # Modèle stable et performant
-NB_RESULTATS = 25  # + de chunks récupérés = réponses plus riches/complètes
-NB_ECHANGES_CONTEXTE = 4  # nb de questions/réponses précédentes gardées comme contexte
+GENERATION_MODEL = "gemini-flash-latest"  # vérifiez le nom exact disponible dans votre AI Studio
+NB_RESULTATS = 25  # + de chunks récupérés = réponses plus riches/complètes (au prix d'un peu de vitesse)
+NB_ECHANGES_CONTEXTE = 4  # nb de questions/réponses précédentes gardées comme contexte de conversation
 
 client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
@@ -34,6 +43,10 @@ def embed_texte(texte: str, prefixe: str):
 
 
 def reformuler_question(question: str, historique: list) -> str:
+    """Transforme une question de suivi ("et pour le GNA ?") en question autonome
+    et complète ("Quelle est l'exigence de teneur en eau pour une GNA ?"), en
+    s'appuyant sur les derniers échanges — uniquement pour améliorer la RECHERCHE,
+    la question affichée à l'agent reste inchangée."""
     if not historique:
         return question
 
@@ -46,13 +59,14 @@ def reformuler_question(question: str, historique: list) -> str:
 Nouvelle question de l'agent : "{question}"
 
 Reformule cette nouvelle question en une question AUTONOME et COMPLÈTE, compréhensible sans le
-reste de la conversation. Ne réponds pas à la question, donne UNIQUEMENT la question reformulée, sans guillemets ni commentaire."""
+reste de la conversation (remplace "il", "ça", "et pour X" etc. par ce à quoi ça fait référence).
+Ne réponds pas à la question, donne UNIQUEMENT la question reformulée, sans guillemets ni commentaire."""
     try:
         resp = client.models.generate_content(model=GENERATION_MODEL, contents=prompt)
         reformulee = (resp.text or "").strip()
         return reformulee if reformulee else question
     except Exception:
-        return question
+        return question  # en cas d'erreur, on retombe sur la question telle quelle
 
 
 def rechercher_chunks(question: str, k=NB_RESULTATS):
@@ -76,8 +90,10 @@ def generer_reponse(question: str, chunks: list, historique: list):
 
     prompt = f"""Tu es un assistant technique pour les agents du LPEE (laboratoire d'essais de matériaux et travaux publics).
 Réponds à la question de façon COMPLÈTE et DÉTAILLÉE, en t'appuyant sur TOUS les extraits pertinents fournis
-ci-dessous. Structure ta réponse avec des sections/puces si le sujet s'y prête.
-Réponds UNIQUEMENT à partir de ces extraits. Si un point précis n'est pas couvert, dis-le clairement.
+ci-dessous (ne te limite pas au premier extrait venu : croise et synthétise l'information de plusieurs sources
+quand elles se complètent). Structure ta réponse avec des sections/puces si le sujet s'y prête.
+Réponds UNIQUEMENT à partir de ces extraits. Si un point précis n'est pas couvert par les extraits, dis-le
+clairement plutôt que d'inventer, plutôt que de raccourcir artificiellement la réponse.
 Cite systématiquement le document et la page source de chaque affirmation, au format (Source X).
 {bloc_historique}
 Extraits disponibles pour cette nouvelle question :
@@ -87,17 +103,32 @@ Question de l'agent : {question}
 
 Réponse (complète, détaillée, structurée, avec citations des sources) :"""
 
-    resp = client.models.generate_content(
-        model=GENERATION_MODEL,
-        contents=prompt,
-        config={"max_output_tokens": 4096},
+    derniere_erreur = None
+    for tentative in range(3):
+        try:
+            resp = client.models.generate_content(
+                model=GENERATION_MODEL,
+                contents=prompt,
+                config={"max_output_tokens": 4096},
+            )
+            if resp.text:
+                return resp.text
+            # Réponse vide (souvent un blocage par les filtres de sécurité Gemini) : pas la peine de réessayer.
+            motif = getattr(resp, "prompt_feedback", None) or getattr(resp.candidates[0], "finish_reason", None) if resp.candidates else None
+            return f"⚠️ Le modèle n'a renvoyé aucun texte (motif : {motif}). Reformulez la question et réessayez."
+        except Exception as e:
+            derniere_erreur = e
+            time.sleep(2 * (tentative + 1))
+
+    return (
+        "⚠️ Erreur du serveur Gemini après plusieurs tentatives — réessayez dans quelques instants.\n\n"
+        f"Détail technique : `{derniere_erreur}`"
     )
-    return resp.text
 
 
 # --- État de la conversation ---
 if "historique" not in st.session_state:
-    st.session_state.historique = []
+    st.session_state.historique = []  # liste de {"role": "user"/"assistant", "content": str, "sources": list}
 
 # --- Interface ---
 st.title("📚 Recherche des normes et fascicules techniques — LPEE")
@@ -121,7 +152,7 @@ for echange in st.session_state.historique:
                     st.caption(c["content"])
                     st.divider()
 
-# Zone de saisie de la nouvelle question
+# Zone de saisie de la nouvelle question, en bas de page (comportement chat classique)
 question = st.chat_input("Posez votre question ou enchaînez sur la précédente...")
 
 if question:

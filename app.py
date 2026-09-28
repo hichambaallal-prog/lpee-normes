@@ -126,6 +126,59 @@ Réponse (complète, détaillée, structurée, avec citations des sources) :"""
     )
 
 
+# --- Téléchargement des PDF originaux (dépôt Hugging Face privé, gratuit) ---
+HF_REPO_ID = st.secrets.get("HF_REPO_ID", "")
+HF_TOKEN = st.secrets.get("HF_TOKEN", "")
+
+
+@st.cache_data(show_spinner="Récupération du PDF...", max_entries=5)
+def telecharger_pdf(chemin_relatif: str) -> bytes:
+    """Télécharge un PDF depuis le dépôt privé Hugging Face (à la demande seulement)."""
+    from huggingface_hub import hf_hub_download
+    chemin_local = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=chemin_relatif.replace("\\", "/"),
+        repo_type="dataset",
+        token=HF_TOKEN,
+    )
+    with open(chemin_local, "rb") as f:
+        return f.read()
+
+
+def afficher_sources(chunks: list, prefixe_cle: str):
+    with st.expander("📎 Sources utilisées"):
+        for c in chunks:
+            meta = c["metadata"]
+            st.markdown(f"**{meta.get('fichier')}** — page {meta.get('page')} (pertinence : {c['similarity']:.0%})")
+            st.caption(c["content"])
+            st.divider()
+
+    if not (HF_REPO_ID and HF_TOKEN):
+        return  # téléchargement non configuré : on n'affiche que les extraits
+
+    fichiers_uniques = {}
+    for c in chunks:
+        meta = c["metadata"]
+        if meta.get("chemin"):
+            fichiers_uniques[meta["chemin"]] = meta.get("fichier")
+
+    if fichiers_uniques:
+        st.markdown("**📥 Télécharger les documents sources**")
+        for i, (chemin, nom) in enumerate(fichiers_uniques.items()):
+            cle = f"{prefixe_cle}_{i}"
+            if st.button(f"📄 {nom}", key=f"prep_{cle}"):
+                try:
+                    st.download_button(
+                        f"⬇️ Enregistrer {nom}",
+                        data=telecharger_pdf(chemin),
+                        file_name=nom,
+                        mime="application/pdf",
+                        key=f"dl_{cle}",
+                    )
+                except Exception as e:
+                    st.error(f"PDF indisponible ({nom}) : {e}")
+
+
 # --- État de la conversation ---
 if "historique" not in st.session_state:
     st.session_state.historique = []  # liste de {"role": "user"/"assistant", "content": str, "sources": list}
@@ -141,16 +194,11 @@ with col_bouton:
         st.rerun()
 
 # Affiche tout l'historique
-for echange in st.session_state.historique:
+for idx, echange in enumerate(st.session_state.historique):
     with st.chat_message("user" if echange["role"] == "user" else "assistant"):
         st.markdown(echange["content"])
         if echange["role"] == "assistant" and echange.get("sources"):
-            with st.expander("📎 Sources utilisées"):
-                for c in echange["sources"]:
-                    meta = c["metadata"]
-                    st.markdown(f"**{meta.get('fichier')}** — page {meta.get('page')} (pertinence : {c['similarity']:.0%})")
-                    st.caption(c["content"])
-                    st.divider()
+            afficher_sources(echange["sources"], prefixe_cle=f"msg{idx}")
 
 # Zone de saisie de la nouvelle question, en bas de page (comportement chat classique)
 question = st.chat_input("Posez votre question ou enchaînez sur la précédente...")
@@ -174,11 +222,7 @@ if question:
                 reponse = generer_reponse(question, chunks, st.session_state.historique[:-1])
 
             st.markdown(reponse)
-            with st.expander("📎 Sources utilisées"):
-                for c in chunks:
-                    meta = c["metadata"]
-                    st.markdown(f"**{meta.get('fichier')}** — page {meta.get('page')} (pertinence : {c['similarity']:.0%})")
-                    st.caption(c["content"])
-                    st.divider()
+            # Même préfixe de clé que celui utilisé plus tard par l'historique (index du message assistant)
+            afficher_sources(chunks, prefixe_cle=f"msg{len(st.session_state.historique)}")
 
             st.session_state.historique.append({"role": "assistant", "content": reponse, "sources": chunks})

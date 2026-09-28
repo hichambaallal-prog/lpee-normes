@@ -23,7 +23,20 @@ from sentence_transformers import SentenceTransformer
 
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
-# --- Authentification multi-utilisateurs simple ---
+# ==========================================
+# GESTION DES LOGINS ET MOTS DE PASSE DES AGENTS
+# ==========================================
+# Vous pouvez ajouter, modifier ou supprimer des comptes facilement ci-dessous :
+# "nom_utilisateur": ("Mot de passe", "Nom complet affiché")
+UTILISATEURS_AUTORISES = {
+    "admin": ("admin123", "Administrateur LPEE"),
+    "agent1": ("lpee2026", "Agent Laboratoire Béton"),
+    "agent2": ("lpee2026", "Agent Laboratoire Sols"),
+    "ingenieur": ("pass123", "Ingénieur d'État"),
+    # Ajoutez d'autres agents ici au besoin :
+    # "username": ("mot_de_passe", "Nom ou rôle de l'agent")
+}
+
 if "authentifie" not in st.session_state:
     st.session_state.authentifie = False
     st.session_state.nom_utilisateur = ""
@@ -33,29 +46,23 @@ if not st.session_state.authentifie:
     st.markdown("Veuillez vous identifier pour accéder aux normes et fascicules techniques.")
     
     with st.form("form_login"):
-        username_input = st.text_input("Nom d'utilisateur")
+        username_input = st.text_input("Nom d'utilisateur").strip()
         password_input = st.text_input("Mot de passe", type="password")
         submit_login = st.form_submit_button("Se connecter")
         
         if submit_login:
-            # Comptes autorisés (Vous pouvez en ajouter facilement ici)
-            if username_input == "admin" and password_input == "admin123":
+            if username_input in UTILISATEURS_AUTORISES and UTILISATEURS_AUTORISES[username_input][0] == password_input:
                 st.session_state.authentifie = True
-                st.session_state.nom_utilisateur = "Administrateur LPEE"
-                st.rerun()
-            elif username_input == "agent" and password_input == "lpee2026":
-                st.session_state.authentifie = True
-                st.session_state.nom_utilisateur = "Agent LPEE"
-                st.rerun()
-            elif username_input == "ingenieur" and password_input == "pass123":
-                st.session_state.authentifie = True
-                st.session_state.nom_utilisateur = "Ingénieur LPEE"
+                st.session_state.nom_utilisateur = UTILISATEURS_AUTORISES[username_input][1]
                 st.rerun()
             else:
                 st.error("Nom d'utilisateur ou mot de passe incorrect.")
     st.stop()
 
-# --- APPLICATION PRINCIPALE (Si connecté) ---
+
+# ==========================================
+# APPLICATION PRINCIPALE
+# ==========================================
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"  # DOIT être le même modèle que dans ingest.py
 # Modèles essayés dans l'ordre : si le premier est saturé (erreur 503), on bascule sur le suivant.
@@ -325,15 +332,15 @@ if question:
             question_recherche = reformuler_question(question, historique[:-1])
             chunks = rechercher_chunks(question_recherche)
 
-            if not chunks:
-                reponse = "Aucun document pertinent trouvé pour cette question. Reformulez-la, ou vérifiez que l'indexation a bien été exécutée."
-                st.markdown(reponse)
-                historique.append({"role": "assistant", "content": reponse, "sources": []})
-            else:
-                with st.spinner("Génération de la réponse..."):
-                    reponse = generer_reponse(question, chunks, historique[:-1])
+        if not chunks:
+            reponse = "Aucun document pertinent trouvé pour cette question. Reformulez-la, ou vérifiez que l'indexation a bien été exécutée."
+            st.markdown(reponse)
+            historique.append({"role": "assistant", "content": reponse, "sources": []})
+        else:
+            with st.spinner("Génération de la réponse..."):
+                reponse = generer_reponse(question, chunks, historique[:-1])
 
-                st.markdown(reponse)
-                afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
+            st.markdown(reponse)
+            afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
 
-                historique.append({"role": "assistant", "content": reponse, "sources": chunks})
+            historique.append({"role": "assistant", "content": reponse, "sources": chunks})

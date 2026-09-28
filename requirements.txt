@@ -5,3 +5,4 @@ sentence-transformers
 pypdf
 python-dotenv
 huggingface_hub
+streamlit-authenticator

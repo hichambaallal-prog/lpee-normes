@@ -45,17 +45,17 @@ authenticator = stauth.Authenticate(
     cookie_expiry_days=30
 )
 
-# Correction de l'appel login pour les versions récentes
+# Appel correct avec le paramètre nommé location
 try:
-    name, authentication_status, username = authenticator.login('main')
-except TypeError:
+    name, authentication_status, username = authenticator.login(location='main')
+except Exception:
     try:
-        authenticator.login('Connexion à la plateforme LPEE', 'main')
+        authenticator.login('Connexion', location='main')
         name = st.session_state.get('name')
         authentication_status = st.session_state.get('authentication_status')
         username = st.session_state.get('username')
     except Exception:
-        name, authentication_status, username = authenticator.login()
+        name, authentication_status, username = None, None, None
 
 if authentication_status == False:
     st.error("Nom d'utilisateur ou mot de passe incorrect")

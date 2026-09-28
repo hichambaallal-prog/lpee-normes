@@ -25,7 +25,6 @@ from sentence_transformers import SentenceTransformer
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
 # --- Configuration de l'authentification ---
-# Structure des identifiants attendue par streamlit-authenticator
 credentials = {
     "usernames": {
         "admin": {
@@ -46,7 +45,17 @@ authenticator = stauth.Authenticate(
     cookie_expiry_days=30
 )
 
-name, authentication_status, username = authenticator.login('Connexion à la plateforme LPEE', 'main')
+# Correction de l'appel login pour les versions récentes
+try:
+    name, authentication_status, username = authenticator.login('main')
+except TypeError:
+    try:
+        authenticator.login('Connexion à la plateforme LPEE', 'main')
+        name = st.session_state.get('name')
+        authentication_status = st.session_state.get('authentication_status')
+        username = st.session_state.get('username')
+    except Exception:
+        name, authentication_status, username = authenticator.login()
 
 if authentication_status == False:
     st.error("Nom d'utilisateur ou mot de passe incorrect")
@@ -254,7 +263,13 @@ Réponse (complète, détaillée, structurée, avec citations des sources) :"""
             st.image("logo_lpee.jpg", use_container_width=True)
         
         st.write(f"Connecté : **{name}**")
-        authenticator.logout('Déconnexion', 'sidebar')
+        try:
+            authenticator.logout('Déconnexion', 'sidebar')
+        except Exception:
+            if st.button("Déconnexion"):
+                st.session_state['authentication_status'] = None
+                st.rerun()
+
         st.markdown("---")
 
         st.header("🗂️ Historique & Sessions")

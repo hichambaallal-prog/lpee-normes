@@ -85,6 +85,69 @@ NB_ECHANGES_CONTEXTE = 4
 client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
+import io
+import json
+import re
+
+
+def _chemin_historique(username: str) -> str:
+    return f"historiques/{re.sub(r'[^a-z0-9_-]', '_', username.lower())}.json"
+
+
+def charger_historique(username: str):
+    """Recharge les conversations de l'utilisateur depuis le dépôt Hugging Face (None si aucune / erreur)."""
+    repo, token = st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", "")
+    if not (repo and token):
+        st.session_state["erreur_historique"] = "HF_REPO_ID / HF_TOKEN manquants dans les Secrets."
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError, RevisionNotFoundError
+        try:
+            chemin = hf_hub_download(
+                repo_id=repo, filename=_chemin_historique(username), repo_type="dataset",
+                token=token, force_download=True,
+            )
+        except (EntryNotFoundError, RevisionNotFoundError):
+            return None  # première connexion : pas encore d'historique
+        with open(chemin, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("sessions"):
+            return data["sessions"], data.get("session_courante")
+    except Exception as e:
+        st.session_state["erreur_historique"] = str(e)
+    return None
+
+
+def sauvegarder_historique():
+    """Enregistre les conversations de l'utilisateur connecté dans le dépôt Hugging Face."""
+    username = st.session_state.get("username_courant")
+    repo, token = st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", "")
+    if not (username and repo and token):
+        return
+    allege = {}
+    for nom, msgs in st.session_state.sessions.items():
+        allege[nom] = [
+            {**m, "sources": [{**c, "content": c["content"][:700]} for c in m["sources"]]} if m.get("sources") else m
+            for m in msgs
+        ]
+    contenu = json.dumps(
+        {"sessions": allege, "session_courante": st.session_state.session_courante},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    try:
+        from huggingface_hub import HfApi
+        HfApi(token=token).upload_file(
+            path_or_fileobj=io.BytesIO(contenu),
+            path_in_repo=_chemin_historique(username),
+            repo_id=repo,
+            repo_type="dataset",
+            commit_message=f"Historique {username}",
+        )
+        st.session_state.pop("erreur_historique", None)
+    except Exception as e:
+        st.session_state["erreur_historique"] = str(e)
+
 
 @st.cache_resource(show_spinner="Chargement du modèle de recherche (une seule fois)...")
 def charger_modele():
@@ -283,10 +346,15 @@ def afficher_sources(chunks: list, prefixe_cle: str):
 
 
 # --- Gestion multi-conversations & historique ---
-if "sessions" not in st.session_state:
-    st.session_state.sessions = {"Conversation 1": []}
-if "session_courante" not in st.session_state:
-    st.session_state.session_courante = "Conversation 1"
+if st.session_state.get("historique_charge_pour") != st.session_state.username_courant:
+    chargé = charger_historique(st.session_state.username_courant)
+    if chargé:
+        st.session_state.sessions, cible = chargé
+        st.session_state.session_courante = cible if cible in st.session_state.sessions else list(st.session_state.sessions)[-1]
+    else:
+        st.session_state.sessions = {"Conversation 1": []}
+        st.session_state.session_courante = "Conversation 1"
+    st.session_state.historique_charge_pour = st.session_state.username_courant
 
 historique = st.session_state.sessions[st.session_state.session_courante]
 
@@ -303,6 +371,8 @@ with st.sidebar:
         st.session_state.username_courant = ""
         st.session_state.nom_utilisateur = ""
         st.session_state.role_utilisateur = ""
+        for k in ("sessions", "session_courante", "historique_charge_pour"):
+            st.session_state.pop(k, None)
         st.rerun()
 
     st.markdown("---")
@@ -373,6 +443,7 @@ with st.sidebar:
         nouvelle_cle = f"Conversation {nb}"
         st.session_state.sessions[nouvelle_cle] = []
         st.session_state.session_courante = nouvelle_cle
+        sauvegarder_historique()
         st.rerun()
 
     st.markdown("---")
@@ -386,6 +457,7 @@ with st.sidebar:
     )
     if session_choisie != st.session_state.session_courante:
         st.session_state.session_courante = session_choisie
+        sauvegarder_historique()
         st.rerun()
 
     st.markdown("---")
@@ -397,6 +469,9 @@ with st.sidebar:
     else:
         st.caption("Aucune question pour l'instant.")
 
+if st.session_state.get("erreur_historique"):
+    st.sidebar.warning("⚠️ Historique non sauvegardé : vérifiez que HF_TOKEN a le droit d'écriture (Write) sur le dépôt.")
+
 # --- Interface Principale ---
 st.title("📚 Recherche des normes et fascicules techniques — LPEE")
 st.caption(f"Session active : **{st.session_state.session_courante}** — Posez une question, puis enchaînez des questions de suivi si besoin.")
@@ -405,6 +480,7 @@ col_titre, col_bouton = st.columns([5, 1])
 with col_bouton:
     if st.button("🗑️ Vider", use_container_width=True):
         st.session_state.sessions[st.session_state.session_courante] = []
+        sauvegarder_historique()
         st.rerun()
 
 for idx, echange in enumerate(historique):
@@ -429,8 +505,10 @@ if question:
             reponse = "Aucun document pertinent trouvé pour cette question. Reformulez-la, ou vérifiez que l'indexation a bien été exécutée."
             st.markdown(reponse)
             historique.append({"role": "assistant", "content": reponse, "sources": []})
+            sauvegarder_historique()
         else:
             prompt = construire_prompt(question, chunks, historique[:-1])
             reponse = st.write_stream(flux_reponse(prompt))  # affichage progressif
             afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
             historique.append({"role": "assistant", "content": reponse, "sources": chunks})
+            sauvegarder_historique()

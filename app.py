@@ -22,6 +22,8 @@ import re
 import time
 
 import streamlit as st
+from datetime import datetime, timedelta
+from streamlit_cookies_controller import CookieController
 from supabase import create_client
 from google import genai
 from google.genai import types
@@ -104,6 +106,43 @@ def modifier_comptes(fn):
     return ok, e
 
 
+# --- Connexion persistante (cookie signé) : reste connecté après un rafraîchissement ou un redéploiement ---
+COOKIE_NOM = "lpee_auth"
+DUREE_COOKIE_JOURS = 7
+
+
+def _cle_signature() -> bytes:
+    return (st.secrets.get("COOKIE_SECRET") or st.secrets.get("HF_TOKEN") or "lpee-secret").encode()
+
+
+def creer_jeton(login: str, empreinte_mdp: str) -> str:
+    expire = int(time.time()) + DUREE_COOKIE_JOURS * 86400
+    base = f"{login}|{expire}"
+    sig = hmac.new(_cle_signature(), f"{base}|{empreinte_mdp}".encode(), hashlib.sha256).hexdigest()
+    return f"{base}|{sig}"
+
+
+def lire_jeton(jeton: str, users: dict):
+    """Retourne le login si le jeton est valide, non expiré et le mot de passe inchangé."""
+    try:
+        login, expire, sig = str(jeton).rsplit("|", 2)
+        if int(expire) < time.time() or login not in users:
+            return None
+        attendu = hmac.new(_cle_signature(), f"{login}|{expire}|{users[login]['password']}".encode(),
+                           hashlib.sha256).hexdigest()
+        return login if hmac.compare_digest(sig, attendu) else None
+    except Exception:
+        return None
+
+
+def poser_cookie(controller, login: str, empreinte_mdp: str):
+    controller.set(
+        COOKIE_NOM, creer_jeton(login, empreinte_mdp),
+        expires=datetime.now() + timedelta(days=DUREE_COOKIE_JOURS),
+        max_age=DUREE_COOKIE_JOURS * 86400, same_site="lax",
+    )
+
+
 if "authentifie" not in st.session_state:
     st.session_state.authentifie = False
 if "username_courant" not in st.session_state:
@@ -112,6 +151,21 @@ if "nom_utilisateur" not in st.session_state:
     st.session_state.nom_utilisateur = ""
 if "role_utilisateur" not in st.session_state:
     st.session_state.role_utilisateur = ""
+
+controller = CookieController()
+
+if not st.session_state.authentifie and not st.session_state.get("deconnexion_volontaire"):
+    _jeton = controller.get(COOKIE_NOM)
+    if _jeton:
+        _users = charger_utilisateurs()
+        _login = lire_jeton(_jeton, _users) if _users else None
+        if _login:
+            st.session_state.utilisateurs = _users
+            st.session_state.authentifie = True
+            st.session_state.username_courant = _login
+            st.session_state.nom_utilisateur = _users[_login]["nom"]
+            st.session_state.role_utilisateur = _users[_login]["role"]
+            st.rerun()
 
 # --- ÉCRAN DE CONNEXION ---
 if not st.session_state.authentifie:
@@ -133,6 +187,9 @@ if not st.session_state.authentifie:
                 st.session_state.username_courant = username_input
                 st.session_state.nom_utilisateur = users[username_input]["nom"]
                 st.session_state.role_utilisateur = users[username_input]["role"]
+                st.session_state.pop("deconnexion_volontaire", None)
+                poser_cookie(controller, username_input, users[username_input]["password"])
+                time.sleep(1)  # laisse le navigateur enregistrer le cookie
                 st.rerun()
             else:
                 st.error("Nom d'utilisateur ou mot de passe incorrect.")
@@ -447,6 +504,12 @@ with st.sidebar:
         st.session_state.role_utilisateur = ""
         for k in ("sessions", "session_courante", "historique_charge_pour"):
             st.session_state.pop(k, None)
+        st.session_state.deconnexion_volontaire = True
+        try:
+            controller.remove(COOKIE_NOM)
+        except Exception:
+            pass
+        time.sleep(0.7)
         st.rerun()
 
     with st.expander("🔑 Changer mon mot de passe"):
@@ -473,6 +536,7 @@ with st.sidebar:
                     users[login]["password"] = hacher_mdp(nouveau)
                 ok, err = modifier_comptes(_changer)
                 if ok:
+                    poser_cookie(controller, login, st.session_state.utilisateurs[login]["password"])
                     st.success("✅ Mot de passe modifié. Utilisez-le à la prochaine connexion.")
                 else:
                     st.error(f"Échec de l'enregistrement : {err}")

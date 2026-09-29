@@ -470,7 +470,8 @@ with st.sidebar:
         st.caption("Aucune question pour l'instant.")
 
 if st.session_state.get("erreur_historique"):
-    st.sidebar.warning("⚠️ Historique non sauvegardé : vérifiez que HF_TOKEN a le droit d'écriture (Write) sur le dépôt.")
+    st.sidebar.warning("⚠️ Historique non sauvegardé. Détail de l'erreur ci-dessous :")
+    st.sidebar.code(str(st.session_state["erreur_historique"])[:400], language=None)
 
 # --- Interface Principale ---
 st.title("📚 Recherche des normes et fascicules techniques — LPEE")

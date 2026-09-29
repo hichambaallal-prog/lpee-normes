@@ -13,7 +13,12 @@ Secrets requis (Streamlit Cloud > Settings > Secrets, format .toml) :
     SUPABASE_KEY = "..."
 """
 
+import hashlib
+import hmac
+import io
+import json
 import os
+import re
 import time
 
 import streamlit as st
@@ -25,14 +30,79 @@ from sentence_transformers import SentenceTransformer
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
 # ==========================================
-# GESTION DES UTILISATEURS (STOCKAGE EN SESSION)
+# GESTION DES UTILISATEURS (stockés sur Hugging Face, mots de passe hachés)
 # ==========================================
-if "utilisateurs" not in st.session_state:
-    st.session_state.utilisateurs = {
-        "admin": {"password": "admin123", "nom": "Administrateur LPEE", "role": "admin"},
-        "agent1": {"password": "lpee2026", "nom": "Agent Laboratoire Béton", "role": "agent"},
-        "agent2": {"password": "lpee2026", "nom": "Agent Laboratoire Sols", "role": "agent"}
-    }
+FICHIER_UTILISATEURS = "utilisateurs.json"
+COMPTES_PAR_DEFAUT = {
+    "admin": {"password": "admin123", "nom": "Administrateur LPEE", "role": "admin"},
+    "agent1": {"password": "lpee2026", "nom": "Agent Laboratoire Béton", "role": "agent"},
+    "agent2": {"password": "lpee2026", "nom": "Agent Laboratoire Sols", "role": "agent"},
+}
+
+
+def hacher_mdp(mdp: str, sel: str = None) -> str:
+    sel = sel or os.urandom(16).hex()
+    h = hashlib.pbkdf2_hmac("sha256", mdp.encode(), bytes.fromhex(sel), 200_000).hex()
+    return f"pbkdf2${sel}${h}"
+
+
+def verifier_mdp(mdp: str, stocke: str) -> bool:
+    if stocke.startswith("pbkdf2$"):
+        _, sel, _h = stocke.split("$")
+        return hmac.compare_digest(hacher_mdp(mdp, sel), stocke)
+    return hmac.compare_digest(mdp.encode(), stocke.encode())  # ancien format en clair
+
+
+def charger_utilisateurs():
+    """Lit la liste des comptes sur Hugging Face. Retourne None si la lecture échoue
+    (pour ne jamais écraser les vrais comptes par les comptes par défaut)."""
+    repo, token = st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", "")
+    defaut = {k: {**v, "password": hacher_mdp(v["password"])} for k, v in COMPTES_PAR_DEFAUT.items()}
+    if not (repo and token):
+        return defaut
+    try:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError, RevisionNotFoundError
+        try:
+            chemin = hf_hub_download(repo_id=repo, filename=FICHIER_UTILISATEURS, repo_type="dataset",
+                                     token=token, force_download=True)
+        except (EntryNotFoundError, RevisionNotFoundError):
+            return defaut  # première utilisation
+        with open(chemin, encoding="utf-8") as f:
+            return json.load(f) or defaut
+    except Exception:
+        return None
+
+
+def sauver_utilisateurs(users: dict):
+    repo, token = st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", "")
+    if not (repo and token):
+        return False, "HF_REPO_ID / HF_TOKEN manquants."
+    try:
+        from huggingface_hub import HfApi
+        HfApi(token=token).upload_file(
+            path_or_fileobj=io.BytesIO(json.dumps(users, ensure_ascii=False, indent=1).encode("utf-8")),
+            path_in_repo=FICHIER_UTILISATEURS, repo_id=repo, repo_type="dataset",
+            commit_message="Mise à jour des comptes",
+        )
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:300]
+
+
+def modifier_comptes(fn):
+    """Relit les comptes, applique fn(users) (retourne un message d'erreur ou None), puis sauvegarde."""
+    users = charger_utilisateurs()
+    if users is None:
+        return False, "Lecture des comptes impossible, réessayez."
+    err = fn(users)
+    if err:
+        return False, err
+    ok, e = sauver_utilisateurs(users)
+    if ok:
+        st.session_state.utilisateurs = users
+    return ok, e
+
 
 if "authentifie" not in st.session_state:
     st.session_state.authentifie = False
@@ -54,11 +124,15 @@ if not st.session_state.authentifie:
         submit_login = st.form_submit_button("Se connecter")
         
         if submit_login:
-            if username_input in st.session_state.utilisateurs and st.session_state.utilisateurs[username_input]["password"] == password_input:
+            users = charger_utilisateurs()
+            if users is None:
+                st.error("Service d'authentification momentanément indisponible. Réessayez dans un instant.")
+            elif username_input in users and verifier_mdp(password_input, users[username_input]["password"]):
+                st.session_state.utilisateurs = users
                 st.session_state.authentifie = True
                 st.session_state.username_courant = username_input
-                st.session_state.nom_utilisateur = st.session_state.utilisateurs[username_input]["nom"]
-                st.session_state.role_utilisateur = st.session_state.utilisateurs[username_input]["role"]
+                st.session_state.nom_utilisateur = users[username_input]["nom"]
+                st.session_state.role_utilisateur = users[username_input]["role"]
                 st.rerun()
             else:
                 st.error("Nom d'utilisateur ou mot de passe incorrect.")
@@ -375,6 +449,34 @@ with st.sidebar:
             st.session_state.pop(k, None)
         st.rerun()
 
+    with st.expander("🔑 Changer mon mot de passe"):
+        with st.form("form_mdp", clear_on_submit=True):
+            ancien = st.text_input("Mot de passe actuel", type="password")
+            nouveau = st.text_input("Nouveau mot de passe (8 caractères min.)", type="password")
+            confirmation = st.text_input("Confirmer le nouveau mot de passe", type="password")
+            valider_mdp = st.form_submit_button("Modifier", use_container_width=True)
+        if valider_mdp:
+            login = st.session_state.username_courant
+            actuels = charger_utilisateurs()
+            if actuels is None or login not in actuels:
+                st.error("Impossible de vérifier votre compte, réessayez.")
+            elif not verifier_mdp(ancien, actuels[login]["password"]):
+                st.error("Mot de passe actuel incorrect.")
+            elif len(nouveau) < 8:
+                st.error("Le nouveau mot de passe doit contenir au moins 8 caractères.")
+            elif nouveau != confirmation:
+                st.error("La confirmation ne correspond pas.")
+            elif verifier_mdp(nouveau, actuels[login]["password"]):
+                st.error("Le nouveau mot de passe doit être différent de l'ancien.")
+            else:
+                def _changer(users):
+                    users[login]["password"] = hacher_mdp(nouveau)
+                ok, err = modifier_comptes(_changer)
+                if ok:
+                    st.success("✅ Mot de passe modifié. Utilisez-le à la prochaine connexion.")
+                else:
+                    st.error(f"Échec de l'enregistrement : {err}")
+
     st.markdown("---")
 
     # --- Section Gestion des Utilisateurs (Visible uniquement pour l'admin) ---
@@ -388,49 +490,63 @@ with st.sidebar:
                 n_pass = st.text_input("Mot de passe", type="password")
                 n_nom = st.text_input("Nom complet / Rôle")
                 n_role = st.selectbox("Rôle", ["agent", "admin"])
-                
+
                 if st.button("Enregistrer l'agent", use_container_width=True):
                     if n_user and n_pass and n_nom:
-                        if n_user in st.session_state.utilisateurs:
-                            st.error("Cet identifiant existe déjà.")
-                        else:
-                            st.session_state.utilisateurs[n_user] = {
-                                "password": n_pass,
-                                "nom": n_nom,
-                                "role": n_role
-                            }
+                        def _ajouter(users):
+                            if n_user in users:
+                                return "Cet identifiant existe déjà."
+                            users[n_user] = {"password": hacher_mdp(n_pass), "nom": n_nom, "role": n_role}
+                        ok, err = modifier_comptes(_ajouter)
+                        if ok:
                             st.success(f"Agent {n_nom} ajouté avec succès !")
                             time.sleep(1)
                             st.rerun()
+                        else:
+                            st.error(err)
                     else:
                         st.warning("Veuillez remplir tous les champs.")
-            
+
             else:
                 st.subheader("Modifier ou Supprimer")
                 liste_logins = list(st.session_state.utilisateurs.keys())
                 sel_user = st.selectbox("Choisir un utilisateur", liste_logins)
-                
+
                 if sel_user:
-                    mod_nom = st.text_input("Nom complet", value=st.session_state.utilisateurs[sel_user]["nom"])
-                    mod_pass = st.text_input("Nouveau mot de passe", value=st.session_state.utilisateurs[sel_user]["password"], type="password")
-                    mod_role = st.selectbox("Rôle", ["agent", "admin"], index=0 if st.session_state.utilisateurs[sel_user]["role"] == "agent" else 1)
-                    
+                    fiche = st.session_state.utilisateurs[sel_user]
+                    mod_nom = st.text_input("Nom complet", value=fiche["nom"])
+                    mod_pass = st.text_input("Nouveau mot de passe (vide = inchangé)", type="password")
+                    mod_role = st.selectbox("Rôle", ["agent", "admin"], index=0 if fiche["role"] == "agent" else 1)
+
                     col_m1, col_m2 = st.columns(2)
                     with col_m1:
                         if st.button("Mettre à jour", use_container_width=True):
-                            st.session_state.utilisateurs[sel_user]["nom"] = mod_nom
-                            st.session_state.utilisateurs[sel_user]["password"] = mod_pass
-                            st.session_state.utilisateurs[sel_user]["role"] = mod_role
-                            st.success("Modifications enregistrées !")
-                            time.sleep(1)
-                            st.rerun()
+                            def _maj(users):
+                                if sel_user not in users:
+                                    return "Utilisateur introuvable."
+                                users[sel_user]["nom"] = mod_nom
+                                users[sel_user]["role"] = mod_role
+                                if mod_pass:
+                                    users[sel_user]["password"] = hacher_mdp(mod_pass)
+                            ok, err = modifier_comptes(_maj)
+                            if ok:
+                                st.success("Modifications enregistrées !")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error(err)
                     with col_m2:
                         if sel_user != "admin":
                             if st.button("Supprimer", use_container_width=True, type="primary"):
-                                del st.session_state.utilisateurs[sel_user]
-                                st.success("Utilisateur supprimé.")
-                                time.sleep(1)
-                                st.rerun()
+                                def _suppr(users):
+                                    users.pop(sel_user, None)
+                                ok, err = modifier_comptes(_suppr)
+                                if ok:
+                                    st.success("Utilisateur supprimé.")
+                                    time.sleep(1)
+                                    st.rerun()
+                                else:
+                                    st.error(err)
                         else:
                             st.caption("Admin principal non supprimable.")
 

@@ -472,8 +472,10 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str, suivi=No
     avec exactement le même format de lignes qu'ingest.py."""
     import fitz  # PyMuPDF
     from huggingface_hub import hf_hub_download
-    local = hf_hub_download(repo_id=repo, filename=chemin, repo_type="dataset", token=token)
     nom = chemin.split("/")[-1]
+    if suivi is not None:
+        suivi["progression"] = f"{nom} — téléchargement depuis Hugging Face"
+    local = hf_hub_download(repo_id=repo, filename=chemin, repo_type="dataset", token=token)
     lignes = []
     with fitz.open(local) as doc:
         for num, page in enumerate(doc, 1):
@@ -562,13 +564,17 @@ def lancer_synchro_auto():
 
     def _tache():
         try:
+            etat["debut"] = time.time()
+            etat["progression"] = "lecture de l'index Supabase"
             try:
                 en_base = chemins_indexes(table)  # une seule lecture de l'index pour les deux étapes
             except Exception:
                 en_base = None
+            etat["progression"] = "nettoyage des normes supprimées"
             _appliquer_resultat(etat, synchroniser_index(existants, table, en_base))
             etat["indexation"] = indexer_nouveaux(existants, table, modele, repo, token, en_base, etat)
         finally:
+            etat["progression"] = None
             etat["verrou"].release()
 
     threading.Thread(target=_tache, daemon=True).start()
@@ -810,7 +816,8 @@ with st.sidebar:
             table_idx = st.secrets.get("SUPABASE_TABLE", "documents")
             _prog = _etat_synchro().get("progression")
             if _prog:
-                st.info("⏳ Indexation en cours : " + _prog)
+                _duree = int((time.time() - _etat_synchro().get("debut", time.time())) / 60)
+                st.info(f"⏳ Indexation en cours (depuis {_duree} min) : " + _prog)
             if st.button("Vérifier l'état de l'index", use_container_width=True):
                 fichiers_pdf_existants.clear()
                 _ex = fichiers_pdf_existants()

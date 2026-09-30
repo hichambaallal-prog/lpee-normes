@@ -430,9 +430,10 @@ def synchroniser_index(existants, table: str) -> dict:
 # INDEXATION AUTOMATIQUE DES NOUVELLES NORMES (Hugging Face -> Supabase)
 # ==========================================
 # ⚠️ À aligner sur ingest.py (même découpage, même préfixe "passage: ", même modèle d'embedding).
-TAILLE_CHUNK = 1000
-CHEVAUCHEMENT = 150
-SEUIL_TEXTE = 40  # moins de caractères sur une page => page scannée => OCR
+TAILLE_CHUNK = 1200       # identique à CHUNK_SIZE d'ingest.py
+CHEVAUCHEMENT = 150       # identique à CHUNK_OVERLAP d'ingest.py
+SEUIL_TEXTE = 20          # moins de caractères sur une page => page scannée => OCR (même seuil qu'ingest.py)
+TAILLE_LOT = 64
 
 
 def _texte_page(page) -> str:
@@ -450,31 +451,25 @@ def _texte_page(page) -> str:
         return texte
 
 
-def _decouper(texte: str) -> list:
-    texte = re.sub(r"[ \t]+", " ", texte)
-    texte = re.sub(r"\n{3,}", "\n\n", texte).strip()
-    if not texte:
-        return []
-    morceaux, debut = [], 0
-    while debut < len(texte):
-        fin = min(debut + TAILLE_CHUNK, len(texte))
-        if fin < len(texte):
-            coupe = texte.rfind("\n", debut + TAILLE_CHUNK // 2, fin)
-            if coupe == -1:
-                coupe = texte.rfind(". ", debut + TAILLE_CHUNK // 2, fin)
-            if coupe != -1:
-                fin = coupe + 1
-        m = texte[debut:fin].strip()
-        if m:
-            morceaux.append(m)
-        if fin >= len(texte):
-            break
-        debut = max(fin - CHEVAUCHEMENT, debut + 1)
-    return morceaux
+def _decouper(texte: str, taille=TAILLE_CHUNK, chevauchement=CHEVAUCHEMENT) -> list:
+    """Même découpage que decouper_en_chunks() d'ingest.py."""
+    chunks, debut, n = [], 0, len(texte)
+    while debut < n:
+        fin = min(debut + taille, n)
+        if fin < n:
+            dernier_espace = texte.rfind(" ", debut, fin)
+            if dernier_espace > debut:
+                fin = dernier_espace
+        morceau = texte[debut:fin].strip()
+        if morceau:
+            chunks.append(morceau)
+        debut = fin - chevauchement if fin - chevauchement > debut else fin
+    return chunks
 
 
 def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str) -> int:
-    """Télécharge un PDF du dépôt, extrait le texte (OCR si besoin), calcule les embeddings et l'ajoute à Supabase."""
+    """Télécharge un PDF du dépôt, extrait le texte (OCR si besoin) et l'ajoute à Supabase,
+    avec exactement le même format de lignes qu'ingest.py."""
     import fitz  # PyMuPDF
     from huggingface_hub import hf_hub_download
     local = hf_hub_download(repo_id=repo, filename=chemin, repo_type="dataset", token=token)
@@ -482,18 +477,26 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str) -> int:
     lignes = []
     with fitz.open(local) as doc:
         for num, page in enumerate(doc, 1):
-            for morceau in _decouper(_texte_page(page)):
-                lignes.append({"content": morceau, "metadata": {"fichier": nom, "page": num, "chemin": chemin}})
+            texte = _texte_page(page)
+            if len(texte) < 20:
+                continue
+            for idx, morceau in enumerate(_decouper(texte)):
+                cid = f"{num}-{idx}"
+                lignes.append({
+                    "content": morceau, "fichier": nom, "chunk_id": cid,
+                    "metadata": {"fichier": nom, "chemin": chemin, "page": num, "chunk_id": cid},
+                })
     if not lignes:
         raise ValueError("aucun texte extrait (OCR indisponible ? vérifiez packages.txt)")
-    vecteurs = modele.encode([f"passage: {l['content']}" for l in lignes],
-                             normalize_embeddings=True, batch_size=16, show_progress_bar=False)
-    for l, v in zip(lignes, vecteurs):
-        l["embedding"] = v.tolist()
-    supabase.table(table).delete().eq("metadata->>chemin", chemin).execute()  # évite les doublons
+    supabase.table(table).delete().eq("metadata->>chemin", chemin).execute()  # repart d'une base propre
     try:
-        for i in range(0, len(lignes), 50):
-            supabase.table(table).insert(lignes[i:i + 50]).execute()
+        for i in range(0, len(lignes), TAILLE_LOT):
+            lot = lignes[i:i + TAILLE_LOT]
+            vecteurs = modele.encode([f"passage: {l['content']}" for l in lot],
+                                     normalize_embeddings=True, show_progress_bar=False)
+            for l, v in zip(lot, vecteurs):
+                l["embedding"] = v.tolist()
+            supabase.table(table).upsert(lot, on_conflict="fichier,chunk_id").execute()
     except Exception:
         try:
             supabase.table(table).delete().eq("metadata->>chemin", chemin).execute()  # pas d'indexation à moitié

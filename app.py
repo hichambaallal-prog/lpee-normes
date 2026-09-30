@@ -10,7 +10,8 @@ tiennent compte de la conversation précédente.
 Secrets requis (Streamlit Cloud > Settings > Secrets, format .toml) :
     GOOGLE_API_KEY = "..."
     SUPABASE_URL = "..."
-    SUPABASE_KEY = "..."
+    SUPABASE_KEY = "..."   # doit autoriser la suppression (clé service_role ou policy DELETE)
+    SUPABASE_TABLE = "documents"   # (optionnel) nom de la table des extraits
 """
 
 import hashlib
@@ -19,6 +20,7 @@ import io
 import json
 import os
 import re
+import threading
 import time
 
 import streamlit as st
@@ -207,7 +209,7 @@ MODELES_GENERATION = [
     "gemini-flash-lite-latest",
 ]
 MODELE_REFORMULATION = "gemini-flash-lite-latest"
-NB_CANDIDATS = 30          # extraits récupérés dans la base
+NB_CANDIDATS = 40          # extraits récupérés dans la base
 NB_MIN_RESULTATS = 8       # minimum gardé même si la pertinence est faible
 NB_MAX_RESULTATS = 20      # maximum envoyé au modèle (prompt plus court = réponse plus rapide)
 ECART_PERTINENCE = 0.08    # on écarte les extraits trop éloignés du meilleur score
@@ -334,15 +336,119 @@ Réponds UNIQUEMENT par la question reformulée, sans guillemets ni commentaire.
         return question
 
 
+# ==========================================
+# SYNCHRONISATION HUGGING FACE -> INDEX (suppression automatique des normes retirées)
+# ==========================================
+INTERVALLE_SYNCHRO = 6 * 3600  # nettoyage complet de l'index toutes les 6 h (le filtrage des recherches, lui, est immédiat)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fichiers_pdf_existants():
+    """Liste des PDF présents dans le dépôt Hugging Face (rafraîchie toutes les 60 s). None si erreur."""
+    try:
+        from huggingface_hub import HfApi
+        fichiers = HfApi(token=st.secrets.get("HF_TOKEN", "")).list_repo_files(
+            st.secrets.get("HF_REPO_ID", ""), repo_type="dataset")
+        return frozenset(f for f in fichiers if f.lower().endswith(".pdf"))
+    except Exception:
+        return None
+
+
+def _chemin_norm(chunk) -> str:
+    return str(chunk["metadata"].get("chemin") or "").replace("\\", "/")
+
+
+def chemins_indexes(table: str) -> set:
+    """Chemins distincts présents dans l'index Supabase.
+    Utilise la fonction SQL chemins_indexes() si elle existe (rapide), sinon parcourt la table."""
+    try:
+        r = supabase.rpc("chemins_indexes", {}).execute()
+        return {l["chemin"] for l in (r.data or []) if l.get("chemin")}
+    except Exception:
+        pass
+    chemins, debut = set(), 0
+    while True:
+        r = supabase.table(table).select("chemin:metadata->>chemin").range(debut, debut + 999).execute()
+        lot = r.data or []
+        chemins.update(l["chemin"] for l in lot if l.get("chemin"))
+        if len(lot) < 1000:
+            break
+        debut += 1000
+    return chemins
+
+
+def synchroniser_index(existants, table: str) -> dict:
+    """Supprime de Supabase les extraits des PDF qui n'existent plus sur Hugging Face.
+    'coherent' = les chemins de l'index correspondent bien à ceux du dépôt (sinon le filtrage reste désactivé)."""
+    if not existants:
+        return {"supprimes": [], "echecs": [], "coherent": False,
+                "erreur": "Liste des PDF Hugging Face indisponible ou vide : rien supprimé."}
+    try:
+        chemins_db = chemins_indexes(table)
+        orphelins = [c for c in chemins_db if c.replace("\\", "/") not in existants]
+        if orphelins and len(orphelins) > max(3, len(chemins_db) // 2):
+            return {"supprimes": [], "echecs": [], "coherent": False, "erreur":
+                    f"Sécurité : {len(orphelins)} documents sur {len(chemins_db)} de l'index ne correspondent à aucun "
+                    "fichier du dépôt Hugging Face (arborescence différente ?). Rien n'est supprimé ni filtré."}
+
+        supprimes, echecs = [], []
+        for c in orphelins:
+            r = supabase.table(table).delete().eq("metadata->>chemin", c).execute()
+            (supprimes if r.data else echecs).append(c)
+        return {"supprimes": supprimes, "echecs": echecs, "coherent": True, "erreur": None}
+    except Exception as e:
+        return {"supprimes": [], "echecs": [], "coherent": None, "erreur": str(e)[:300]}
+
+
+@st.cache_resource
+def _etat_synchro():
+    # filtre_sur : True seulement après avoir vérifié que l'index et Hugging Face utilisent les mêmes chemins
+    return {"dernier": 0.0, "verrou": threading.Lock(), "resultat": None, "filtre_sur": False}
+
+
+def _appliquer_resultat(etat, r):
+    etat["resultat"] = r
+    if r.get("coherent") is not None:
+        etat["filtre_sur"] = bool(r["coherent"])
+
+
+def lancer_synchro_auto():
+    """Vérification + nettoyage en arrière-plan (au démarrage puis toutes les 6 h), sans ralentir l'utilisateur."""
+    etat = _etat_synchro()
+    if time.time() - etat["dernier"] < INTERVALLE_SYNCHRO:
+        return
+    existants = fichiers_pdf_existants()
+    if not existants or not etat["verrou"].acquire(blocking=False):
+        return
+    etat["dernier"] = time.time()
+    table = st.secrets.get("SUPABASE_TABLE", "documents")
+
+    def _tache():
+        try:
+            _appliquer_resultat(etat, synchroniser_index(existants, table))
+        finally:
+            etat["verrou"].release()
+
+    threading.Thread(target=_tache, daemon=True).start()
+
+
 @st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
-def rechercher_chunks(question: str):
-    """Recherche vectorielle (mise en cache) + filtrage par pertinence + tri par document/page."""
+def _candidats(question: str):
     vecteur = embed_texte(question, prefixe="query")
     res = supabase.rpc("match_documents", {
         "query_embedding": vecteur,
         "match_count": NB_CANDIDATS,
     }).execute()
-    candidats = sorted(res.data or [], key=lambda c: c["similarity"], reverse=True)
+    return sorted(res.data or [], key=lambda c: c["similarity"], reverse=True)
+
+
+def rechercher_chunks(question: str):
+    """Recherche vectorielle + écarte immédiatement les normes supprimées de Hugging Face
+    + filtrage par pertinence + tri par document/page."""
+    candidats = _candidats(question)
+    existants = fichiers_pdf_existants()
+    if existants and _etat_synchro()["filtre_sur"]:
+        candidats = [c for c in candidats if not _chemin_norm(c) or _chemin_norm(c) in existants]
     if not candidats:
         return []
 
@@ -541,6 +647,31 @@ with st.sidebar:
                 else:
                     st.error(f"Échec de l'enregistrement : {err}")
 
+    if st.session_state.role_utilisateur == "admin":
+        with st.expander("🧹 Synchronisation des normes"):
+            st.caption("Les normes supprimées de Hugging Face sont retirées automatiquement des recherches, "
+                       "puis de l'index (vérification au démarrage puis toutes les 6 h).")
+            table_idx = st.secrets.get("SUPABASE_TABLE", "documents")
+            if st.button("Synchroniser maintenant", use_container_width=True):
+                fichiers_pdf_existants.clear()
+                with st.spinner("Synchronisation..."):
+                    r = synchroniser_index(fichiers_pdf_existants(), table_idx)
+                    _appliquer_resultat(_etat_synchro(), r)
+                if r["erreur"]:
+                    st.error(r["erreur"])
+                elif r["echecs"]:
+                    st.warning("Suppression refusée par Supabase (droits insuffisants ?) : "
+                               + ", ".join(r["echecs"]))
+                elif r["supprimes"]:
+                    st.success("Retirées de l'index : " + ", ".join(r["supprimes"]))
+                else:
+                    st.success("Index déjà à jour.")
+            auto = _etat_synchro().get("resultat")
+            if auto and auto["supprimes"]:
+                st.caption("Dernier nettoyage auto : " + ", ".join(auto["supprimes"]))
+            if auto and (auto["erreur"] or auto["echecs"]):
+                st.caption("⚠️ Nettoyage auto : " + (auto["erreur"] or "suppression refusée (droits Supabase)"))
+
     st.markdown("---")
 
     # --- Section Gestion des Utilisateurs (Visible uniquement pour l'admin) ---
@@ -652,6 +783,8 @@ with st.sidebar:
 if st.session_state.get("erreur_historique"):
     st.sidebar.warning("⚠️ Historique non sauvegardé. Détail de l'erreur ci-dessous :")
     st.sidebar.code(str(st.session_state["erreur_historique"])[:400], language=None)
+
+lancer_synchro_auto()
 
 # --- Interface Principale ---
 st.title("📚 Recherche des normes et fascicules techniques — LPEE")

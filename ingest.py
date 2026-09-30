@@ -13,13 +13,17 @@ Usage :
     python ingest.py
 
 Variables d'environnement requises (voir .env.example) :
-    SUPABASE_URL        -> URL de votre projet Supabase
-    SUPABASE_KEY        -> clé "service_role" de Supabase (Project Settings > API)
-    PDF_FOLDER           -> chemin local vers le dossier OneDrive à indexer
+    SUPABASE_URL -> URL de votre projet Supabase
+    SUPABASE_KEY -> clé "service_role" de Supabase (Project Settings > API)
+    PDF_FOLDER   -> chemin local vers le dossier OneDrive à indexer
 
 Au premier lancement, le modèle (~470 Mo) est téléchargé automatiquement
 depuis Hugging Face et mis en cache localement — ensuite tout fonctionne
 hors-ligne pour l'embedding.
+
+NOUVEAU : le manifeste se "répare" tout seul. Si une norme a été retirée de l'index
+(par exemple supprimée automatiquement par l'application après sa suppression sur
+Hugging Face) puis remise plus tard, elle est ré-indexée au prochain lancement.
 """
 
 import json
@@ -39,11 +43,12 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 PDF_FOLDER = os.environ.get("PDF_FOLDER", r"C:\Users\VotreNom\OneDrive\Normes_LPEE")
 
 EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"  # gratuit, local, 384 dimensions, bon en français
-EMBEDDING_DIM = 384            # doit correspondre à la colonne vector(384) du schema.sql
-CHUNK_SIZE = 1200              # caractères par chunk (≈ 250-300 mots)
-CHUNK_OVERLAP = 150            # chevauchement entre chunks pour ne pas couper une idée en deux
-BATCH_SIZE = 64                # nb de chunks encodés ensemble (purement local, peut être plus grand)
+EMBEDDING_DIM = 384          # doit correspondre à la colonne vector(384) du schema.sql
+CHUNK_SIZE = 1200            # caractères par chunk (≈ 250-300 mots)
+CHUNK_OVERLAP = 150          # chevauchement entre chunks pour ne pas couper une idée en deux
+BATCH_SIZE = 64              # nb de chunks encodés ensemble (purement local, peut être plus grand)
 MANIFEST_PATH = Path("ingest_manifest.json")  # mémorise les fichiers déjà traités (reprise après interruption)
+MARQUEUR_VIDE = "|vide"      # fichier lu mais sans texte exploitable (scanné) : inutile de le retraiter à chaque fois
 
 print("Chargement du modèle d'embedding local (une seule fois, peut prendre 1-2 min la première fois)...")
 modele = SentenceTransformer(EMBEDDING_MODEL_NAME)
@@ -66,6 +71,44 @@ def hash_fichier(chemin: Path) -> str:
     return f"{stat.st_size}-{int(stat.st_mtime)}"
 
 
+def chemins_en_base() -> set:
+    """Chemins distincts actuellement présents dans Supabase (None si la lecture échoue)."""
+    try:
+        r = supabase.rpc("chemins_indexes", {}).execute()   # rapide si la fonction SQL existe
+        return {l["chemin"] for l in (r.data or []) if l.get("chemin")}
+    except Exception:
+        pass
+    try:
+        chemins, debut = set(), 0
+        while True:
+            r = supabase.table("documents").select("chemin:metadata->>chemin").range(debut, debut + 999).execute()
+            lot = r.data or []
+            chemins.update(l["chemin"] for l in lot if l.get("chemin"))
+            if len(lot) < 1000:
+                break
+            debut += 1000
+        return chemins
+    except Exception as e:
+        print(f"⚠️ Vérification de l'index impossible ({e}) : manifeste laissé tel quel.")
+        return None
+
+
+def reparer_manifest(manifest: dict):
+    """Retire du manifeste les fichiers qui ne sont plus dans Supabase, pour qu'ils soient ré-indexés."""
+    en_base = chemins_en_base()
+    if en_base is None:
+        return
+    en_base_norm = {c.replace("\\", "/") for c in en_base}
+    a_retirer = [
+        k for k, v in manifest.items()
+        if not str(v).endswith(MARQUEUR_VIDE) and k.replace("\\", "/") not in en_base_norm
+    ]
+    for k in a_retirer:
+        del manifest[k]
+    if a_retirer:
+        print(f"🔧 {len(a_retirer)} fichier(s) absents de l'index seront (ré)indexés.\n")
+
+
 def extraire_pages(chemin: Path):
     """Retourne une liste de (numero_page, texte). Signale les pages probablement scannées (peu de texte)."""
     pages = []
@@ -75,7 +118,7 @@ def extraire_pages(chemin: Path):
             texte = (page.extract_text() or "").strip()
             pages.append((i, texte))
     except Exception as e:
-        print(f"  ⚠️  Erreur de lecture {chemin.name} : {e}")
+        print(f"  ⚠️ Erreur de lecture {chemin.name} : {e}")
     return pages
 
 
@@ -110,8 +153,8 @@ def indexer_fichier(chemin: Path, racine: Path, manifest: dict):
     chemin_relatif = str(chemin.relative_to(racine))
     empreinte = hash_fichier(chemin)
 
-    if manifest.get(chemin_relatif) == empreinte:
-        return 0  # déjà indexé et inchangé depuis la dernière exécution
+    if str(manifest.get(chemin_relatif, "")).split("|")[0] == empreinte:
+        return 0  # déjà traité et inchangé depuis la dernière exécution
 
     print(f"📄 {chemin_relatif}")
     pages = extraire_pages(chemin)
@@ -120,7 +163,7 @@ def indexer_fichier(chemin: Path, racine: Path, manifest: dict):
 
     nb_pages_vides = sum(1 for _, t in pages if len(t) < 20)
     if nb_pages_vides > len(pages) * 0.7:
-        print(f"  ⚠️  Ce document semble scanné (peu de texte extrait) — envisager un passage OCR séparé.")
+        print(f"  ⚠️ Ce document semble scanné (peu de texte extrait) — envisager un passage OCR séparé.")
 
     lignes_a_inserer = []
     for numero_page, texte in pages:
@@ -140,7 +183,7 @@ def indexer_fichier(chemin: Path, racine: Path, manifest: dict):
             })
 
     if not lignes_a_inserer:
-        manifest[chemin_relatif] = empreinte
+        manifest[chemin_relatif] = empreinte + MARQUEUR_VIDE
         return 0
 
     total_insere = 0
@@ -165,6 +208,7 @@ def main():
         raise SystemExit(f"Dossier introuvable : {racine}")
 
     manifest = charger_manifest()
+    reparer_manifest(manifest)
     fichiers_pdf = sorted(racine.rglob("*.pdf"))
     print(f"{len(fichiers_pdf)} fichier(s) PDF trouvé(s) dans {racine}\n")
 

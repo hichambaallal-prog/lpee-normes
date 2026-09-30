@@ -7,3 +7,6 @@ python-dotenv
 huggingface_hub
 streamlit-authenticator
 streamlit-cookies-controller
+pymupdf
+pytesseract
+pillow

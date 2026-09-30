@@ -834,6 +834,9 @@ with st.sidebar:
                             st.success("Tous les PDF du dépôt sont indexés.")
                     except Exception as _e:
                         st.error(f"Lecture de l'index impossible : {str(_e)[:300]}")
+                        if "57014" in str(_e) or "timeout" in str(_e).lower():
+                            st.info("L'index Supabase est trop lent à lire : exécutez le script "
+                                    "optimisation_supabase.sql dans Supabase > SQL Editor.")
             if st.button("Synchroniser maintenant", use_container_width=True):
                 fichiers_pdf_existants.clear()
                 etat = _etat_synchro()

@@ -340,7 +340,7 @@ Réponds UNIQUEMENT par la question reformulée, sans guillemets ni commentaire.
 # ==========================================
 # SYNCHRONISATION HUGGING FACE -> INDEX (suppression automatique des normes retirées)
 # ==========================================
-INTERVALLE_SYNCHRO = 10 * 60  # ajouts + suppressions vérifiés toutes les 10 min (et au démarrage)
+INTERVALLE_SYNCHRO = 30 * 60  # ajouts + suppressions vérifiés toutes les 30 min (et au démarrage)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -403,14 +403,14 @@ def chemins_indexes(table: str) -> set:
     return chemins
 
 
-def synchroniser_index(existants, table: str) -> dict:
+def synchroniser_index(existants, table: str, chemins_db=None) -> dict:
     """Supprime de Supabase les extraits des PDF qui n'existent plus sur Hugging Face.
     'coherent' = les chemins de l'index correspondent bien à ceux du dépôt (sinon le filtrage reste désactivé)."""
     if not existants:
         return {"supprimes": [], "echecs": [], "coherent": False,
                 "erreur": "Liste des PDF Hugging Face indisponible ou vide : rien supprimé."}
     try:
-        chemins_db = chemins_indexes(table)
+        chemins_db = chemins_db if chemins_db is not None else chemins_indexes(table)
         orphelins = [c for c in chemins_db if _norm_chemin(c) not in existants]
         if orphelins and len(orphelins) > max(3, len(chemins_db) // 2):
             return {"supprimes": [], "echecs": [], "coherent": False, "erreur":
@@ -506,13 +506,13 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str) -> int:
     return len(lignes)
 
 
-def indexer_nouveaux(existants, table: str, modele, repo: str, token: str) -> dict:
+def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemins_db=None) -> dict:
     """Indexe les PDF présents sur Hugging Face mais absents de l'index Supabase."""
     res = {"indexes": [], "echecs": {}, "erreur": None}
     if not existants:
         return res
     try:
-        deja = {_norm_chemin(c) for c in chemins_indexes(table)}
+        deja = {_norm_chemin(c) for c in (chemins_db if chemins_db is not None else chemins_indexes(table))}
     except Exception as e:
         res["erreur"] = str(e)[:300]
         return res
@@ -556,8 +556,12 @@ def lancer_synchro_auto():
 
     def _tache():
         try:
-            _appliquer_resultat(etat, synchroniser_index(existants, table))
-            etat["indexation"] = indexer_nouveaux(existants, table, modele, repo, token)
+            try:
+                en_base = chemins_indexes(table)  # une seule lecture de l'index pour les deux étapes
+            except Exception:
+                en_base = None
+            _appliquer_resultat(etat, synchroniser_index(existants, table, en_base))
+            etat["indexation"] = indexer_nouveaux(existants, table, modele, repo, token, en_base)
         finally:
             etat["verrou"].release()
 
@@ -796,7 +800,7 @@ with st.sidebar:
     if st.session_state.role_utilisateur == "admin":
         with st.expander("🧹 Synchronisation des normes"):
             st.caption("Les normes ajoutées sur Hugging Face sont lues (OCR si scannées) et ajoutées à l'index ; "
-                       "celles supprimées en sont retirées (vérification au démarrage puis toutes les 10 min).")
+                       "celles supprimées en sont retirées (vérification au démarrage puis toutes les 30 min).")
             table_idx = st.secrets.get("SUPABASE_TABLE", "documents")
             if st.button("Synchroniser maintenant", use_container_width=True):
                 fichiers_pdf_existants.clear()
@@ -978,9 +982,11 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
+        t0 = time.time()
         with st.spinner("Recherche dans les documents indexés..."):
             question_recherche = reformuler_question(question, historique[:-1])
             chunks = rechercher_chunks(question_recherche)
+        t_recherche = time.time() - t0
 
         if not chunks:
             reponse = "Aucun document pertinent trouvé pour cette question. Reformulez-la, ou vérifiez que l'indexation a bien été exécutée."
@@ -989,7 +995,10 @@ if question:
             sauvegarder_historique()
         else:
             prompt = construire_prompt(question, chunks, historique[:-1])
+            t1 = time.time()
             reponse = st.write_stream(flux_reponse(prompt))  # affichage progressif
+            t_generation = time.time() - t1
             afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
+            st.caption(f"⏱️ Recherche : {t_recherche:.1f} s · Génération de la réponse : {t_generation:.1f} s")
             historique.append({"role": "assistant", "content": reponse, "sources": chunks})
             sauvegarder_historique()

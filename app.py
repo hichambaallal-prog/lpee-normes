@@ -999,6 +999,7 @@ lancer_synchro_auto()
 
 # --- Interface Principale ---
 st.title("📚 Recherche des normes et fascicules techniques — LPEE")
+st.subheader(f"👋 Bonjour {st.session_state.nom_utilisateur}")
 st.caption(f"Session active : **{st.session_state.session_courante}** — Posez une question, puis enchaînez des questions de suivi si besoin.")
 
 col_titre, col_bouton = st.columns([5, 1])

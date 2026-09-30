@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 
 import streamlit as st
 from datetime import datetime, timedelta
@@ -349,13 +350,38 @@ def fichiers_pdf_existants():
         from huggingface_hub import HfApi
         fichiers = HfApi(token=st.secrets.get("HF_TOKEN", "")).list_repo_files(
             st.secrets.get("HF_REPO_ID", ""), repo_type="dataset")
-        return frozenset(f for f in fichiers if f.lower().endswith(".pdf"))
+        return frozenset(_norm_chemin(f) for f in fichiers if f.lower().endswith(".pdf"))
     except Exception:
         return None
 
 
+def _norm_chemin(chemin) -> str:
+    """Même forme pour les chemins Windows (\\) et Hugging Face (/), accents normalisés."""
+    return unicodedata.normalize("NFC", str(chemin or "")).replace("\\", "/")
+
+
 def _chemin_norm(chunk) -> str:
-    return str(chunk["metadata"].get("chemin") or "").replace("\\", "/")
+    return _norm_chemin(chunk["metadata"].get("chemin"))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def layout_coherent() -> bool:
+    """Vérifie (sur un échantillon de l'index) que les chemins de Supabase correspondent à ceux de
+    Hugging Face. Si oui, on peut masquer sans risque les normes supprimées."""
+    existants = fichiers_pdf_existants()
+    if not existants:
+        return False
+    table = st.secrets.get("SUPABASE_TABLE", "documents")
+    chemins = []
+    for debut in (0, 3000, 10000, 30000, 80000):
+        try:
+            r = supabase.table(table).select("chemin:metadata->>chemin").range(debut, debut + 59).execute()
+            chemins += [l["chemin"] for l in (r.data or []) if l.get("chemin")]
+        except Exception:
+            continue
+    if not chemins:
+        return False
+    return sum(1 for c in chemins if _norm_chemin(c) in existants) / len(chemins) >= 0.5
 
 
 def chemins_indexes(table: str) -> set:
@@ -385,7 +411,7 @@ def synchroniser_index(existants, table: str) -> dict:
                 "erreur": "Liste des PDF Hugging Face indisponible ou vide : rien supprimé."}
     try:
         chemins_db = chemins_indexes(table)
-        orphelins = [c for c in chemins_db if c.replace("\\", "/") not in existants]
+        orphelins = [c for c in chemins_db if _norm_chemin(c) not in existants]
         if orphelins and len(orphelins) > max(3, len(chemins_db) // 2):
             return {"supprimes": [], "echecs": [], "coherent": False, "erreur":
                     f"Sécurité : {len(orphelins)} documents sur {len(chemins_db)} de l'index ne correspondent à aucun "
@@ -447,7 +473,7 @@ def rechercher_chunks(question: str):
     + filtrage par pertinence + tri par document/page."""
     candidats = _candidats(question)
     existants = fichiers_pdf_existants()
-    if existants and _etat_synchro()["filtre_sur"]:
+    if existants and layout_coherent():
         candidats = [c for c in candidats if not _chemin_norm(c) or _chemin_norm(c) in existants]
     if not candidats:
         return []
@@ -549,18 +575,32 @@ def telecharger_pdf(chemin_relatif: str) -> bytes:
 
 
 def afficher_sources(chunks: list, prefixe_cle: str):
+    existants = fichiers_pdf_existants()
+    verif = bool(existants) and layout_coherent()
+
+    def _supprime(c) -> bool:
+        return verif and bool(_chemin_norm(c)) and _chemin_norm(c) not in existants
+
+    nb_retirees = sum(1 for c in chunks if _supprime(c))
     with st.expander("📎 Sources utilisées"):
         for i, c in enumerate(chunks, 1):
+            if _supprime(c):
+                continue
             meta = c["metadata"]
             st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} (pertinence : {c['similarity']:.0%})")
             st.caption(c["content"])
             st.divider()
+
+    if nb_retirees:
+        st.caption(f"ℹ️ {nb_retirees} extrait(s) cité(s) proviennent de documents retirés de la base : masqués.")
 
     if not (HF_REPO_ID and HF_TOKEN):
         return
 
     fichiers_uniques = {}
     for c in chunks:
+        if _supprime(c):
+            continue
         meta = c["metadata"]
         if meta.get("chemin"):
             fichiers_uniques[meta["chemin"]] = meta.get("fichier")

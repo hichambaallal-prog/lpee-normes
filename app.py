@@ -467,7 +467,7 @@ def _decouper(texte: str, taille=TAILLE_CHUNK, chevauchement=CHEVAUCHEMENT) -> l
     return chunks
 
 
-def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str) -> int:
+def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str, suivi=None) -> int:
     """Télécharge un PDF du dépôt, extrait le texte (OCR si besoin) et l'ajoute à Supabase,
     avec exactement le même format de lignes qu'ingest.py."""
     import fitz  # PyMuPDF
@@ -477,6 +477,8 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str) -> int:
     lignes = []
     with fitz.open(local) as doc:
         for num, page in enumerate(doc, 1):
+            if suivi is not None:
+                suivi["progression"] = f"{nom} — lecture/OCR page {num}/{len(doc)}"
             texte = _texte_page(page)
             if len(texte) < 20:
                 continue
@@ -488,6 +490,8 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str) -> int:
                 })
     if not lignes:
         raise ValueError("aucun texte extrait (OCR indisponible ? vérifiez packages.txt)")
+    if suivi is not None:
+        suivi["progression"] = f"{nom} — calcul des embeddings et envoi ({len(lignes)} extraits)"
     supabase.table(table).delete().eq("metadata->>chemin", chemin).execute()  # repart d'une base propre
     try:
         for i in range(0, len(lignes), TAILLE_LOT):
@@ -506,7 +510,7 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str) -> int:
     return len(lignes)
 
 
-def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemins_db=None) -> dict:
+def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemins_db=None, suivi=None) -> dict:
     """Indexe les PDF présents sur Hugging Face mais absents de l'index Supabase."""
     res = {"indexes": [], "echecs": {}, "erreur": None}
     if not existants:
@@ -518,10 +522,12 @@ def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemi
         return res
     for chemin in sorted(set(existants) - deja):
         try:
-            n = indexer_pdf(chemin, table, modele, repo, token)
+            n = indexer_pdf(chemin, table, modele, repo, token, suivi)
             res["indexes"].append(f"{chemin} ({n} extraits)")
         except Exception as e:
             res["echecs"][chemin] = str(e)[:200]
+    if suivi is not None:
+        suivi["progression"] = None
     if res["indexes"]:
         _candidats.clear()  # les recherches mises en cache (1 h) ne verraient pas la nouvelle norme
     return res
@@ -561,7 +567,7 @@ def lancer_synchro_auto():
             except Exception:
                 en_base = None
             _appliquer_resultat(etat, synchroniser_index(existants, table, en_base))
-            etat["indexation"] = indexer_nouveaux(existants, table, modele, repo, token, en_base)
+            etat["indexation"] = indexer_nouveaux(existants, table, modele, repo, token, en_base, etat)
         finally:
             etat["verrou"].release()
 
@@ -802,11 +808,32 @@ with st.sidebar:
             st.caption("Les normes ajoutées sur Hugging Face sont lues (OCR si scannées) et ajoutées à l'index ; "
                        "celles supprimées en sont retirées (vérification au démarrage puis toutes les 30 min).")
             table_idx = st.secrets.get("SUPABASE_TABLE", "documents")
+            _prog = _etat_synchro().get("progression")
+            if _prog:
+                st.info("⏳ Indexation en cours : " + _prog)
+            if st.button("Vérifier l'état de l'index", use_container_width=True):
+                fichiers_pdf_existants.clear()
+                _ex = fichiers_pdf_existants()
+                if not _ex:
+                    st.error("Liste des PDF Hugging Face indisponible (vérifiez HF_REPO_ID / HF_TOKEN).")
+                else:
+                    try:
+                        _en_base = {_norm_chemin(c) for c in chemins_indexes(table_idx)}
+                        _manq = sorted(set(_ex) - _en_base)
+                        st.write(f"{len(_ex)} PDF sur Hugging Face · {len(set(_ex) & _en_base)} indexés")
+                        if _manq:
+                            st.warning("Pas encore indexés : " + ", ".join(_manq))
+                        else:
+                            st.success("Tous les PDF du dépôt sont indexés.")
+                    except Exception as _e:
+                        st.error(f"Lecture de l'index impossible : {str(_e)[:300]}")
             if st.button("Synchroniser maintenant", use_container_width=True):
                 fichiers_pdf_existants.clear()
                 etat = _etat_synchro()
                 if not etat["verrou"].acquire(blocking=False):
-                    st.info("Une synchronisation est déjà en cours en arrière-plan. Réessayez dans quelques minutes.")
+                    st.info("⏳ Une indexation est déjà en cours en arrière-plan"
+                            + (f" : {etat['progression']}" if etat.get("progression") else "")
+                            + ". La norme sera cherchable à la fin. Cliquez sur « Vérifier l'état » pour suivre.")
                 else:
                     try:
                         with st.spinner("Synchronisation (l'OCR d'une norme scannée peut prendre plusieurs minutes)..."):
@@ -814,7 +841,8 @@ with st.sidebar:
                             r = synchroniser_index(existants, table_idx)
                             _appliquer_resultat(etat, r)
                             ri = indexer_nouveaux(existants, table_idx, charger_modele(),
-                                                  st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", ""))
+                                                  st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", ""),
+                                                  suivi=etat)
                             etat["indexation"] = ri
                     finally:
                         etat["verrou"].release()

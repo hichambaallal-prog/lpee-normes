@@ -340,7 +340,7 @@ Réponds UNIQUEMENT par la question reformulée, sans guillemets ni commentaire.
 # ==========================================
 # SYNCHRONISATION HUGGING FACE -> INDEX (suppression automatique des normes retirées)
 # ==========================================
-INTERVALLE_SYNCHRO = 6 * 3600  # nettoyage complet de l'index toutes les 6 h (le filtrage des recherches, lui, est immédiat)
+INTERVALLE_SYNCHRO = 10 * 60  # ajouts + suppressions vérifiés toutes les 10 min (et au démarrage)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -426,6 +426,104 @@ def synchroniser_index(existants, table: str) -> dict:
         return {"supprimes": [], "echecs": [], "coherent": None, "erreur": str(e)[:300]}
 
 
+# ==========================================
+# INDEXATION AUTOMATIQUE DES NOUVELLES NORMES (Hugging Face -> Supabase)
+# ==========================================
+# ⚠️ À aligner sur ingest.py (même découpage, même préfixe "passage: ", même modèle d'embedding).
+TAILLE_CHUNK = 1000
+CHEVAUCHEMENT = 150
+SEUIL_TEXTE = 40  # moins de caractères sur une page => page scannée => OCR
+
+
+def _texte_page(page) -> str:
+    """Texte d'une page PDF : couche texte si elle existe, sinon OCR Tesseract (français)."""
+    texte = page.get_text("text").strip()
+    if len(texte) >= SEUIL_TEXTE:
+        return texte
+    try:
+        import pytesseract
+        from PIL import Image
+        pix = page.get_pixmap(dpi=200)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return pytesseract.image_to_string(img, lang="fra").strip()
+    except Exception:
+        return texte
+
+
+def _decouper(texte: str) -> list:
+    texte = re.sub(r"[ \t]+", " ", texte)
+    texte = re.sub(r"\n{3,}", "\n\n", texte).strip()
+    if not texte:
+        return []
+    morceaux, debut = [], 0
+    while debut < len(texte):
+        fin = min(debut + TAILLE_CHUNK, len(texte))
+        if fin < len(texte):
+            coupe = texte.rfind("\n", debut + TAILLE_CHUNK // 2, fin)
+            if coupe == -1:
+                coupe = texte.rfind(". ", debut + TAILLE_CHUNK // 2, fin)
+            if coupe != -1:
+                fin = coupe + 1
+        m = texte[debut:fin].strip()
+        if m:
+            morceaux.append(m)
+        if fin >= len(texte):
+            break
+        debut = max(fin - CHEVAUCHEMENT, debut + 1)
+    return morceaux
+
+
+def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str) -> int:
+    """Télécharge un PDF du dépôt, extrait le texte (OCR si besoin), calcule les embeddings et l'ajoute à Supabase."""
+    import fitz  # PyMuPDF
+    from huggingface_hub import hf_hub_download
+    local = hf_hub_download(repo_id=repo, filename=chemin, repo_type="dataset", token=token)
+    nom = chemin.split("/")[-1]
+    lignes = []
+    with fitz.open(local) as doc:
+        for num, page in enumerate(doc, 1):
+            for morceau in _decouper(_texte_page(page)):
+                lignes.append({"content": morceau, "metadata": {"fichier": nom, "page": num, "chemin": chemin}})
+    if not lignes:
+        raise ValueError("aucun texte extrait (OCR indisponible ? vérifiez packages.txt)")
+    vecteurs = modele.encode([f"passage: {l['content']}" for l in lignes],
+                             normalize_embeddings=True, batch_size=16, show_progress_bar=False)
+    for l, v in zip(lignes, vecteurs):
+        l["embedding"] = v.tolist()
+    supabase.table(table).delete().eq("metadata->>chemin", chemin).execute()  # évite les doublons
+    try:
+        for i in range(0, len(lignes), 50):
+            supabase.table(table).insert(lignes[i:i + 50]).execute()
+    except Exception:
+        try:
+            supabase.table(table).delete().eq("metadata->>chemin", chemin).execute()  # pas d'indexation à moitié
+        except Exception:
+            pass
+        raise
+    return len(lignes)
+
+
+def indexer_nouveaux(existants, table: str, modele, repo: str, token: str) -> dict:
+    """Indexe les PDF présents sur Hugging Face mais absents de l'index Supabase."""
+    res = {"indexes": [], "echecs": {}, "erreur": None}
+    if not existants:
+        return res
+    try:
+        deja = {_norm_chemin(c) for c in chemins_indexes(table)}
+    except Exception as e:
+        res["erreur"] = str(e)[:300]
+        return res
+    for chemin in sorted(set(existants) - deja):
+        try:
+            n = indexer_pdf(chemin, table, modele, repo, token)
+            res["indexes"].append(f"{chemin} ({n} extraits)")
+        except Exception as e:
+            res["echecs"][chemin] = str(e)[:200]
+    if res["indexes"]:
+        _candidats.clear()  # les recherches mises en cache (1 h) ne verraient pas la nouvelle norme
+    return res
+
+
 @st.cache_resource
 def _etat_synchro():
     # filtre_sur : True seulement après avoir vérifié que l'index et Hugging Face utilisent les mêmes chemins
@@ -439,19 +537,24 @@ def _appliquer_resultat(etat, r):
 
 
 def lancer_synchro_auto():
-    """Vérification + nettoyage en arrière-plan (au démarrage puis toutes les 6 h), sans ralentir l'utilisateur."""
+    """Synchronisation en arrière-plan (ajouts + suppressions), sans ralentir l'utilisateur."""
     etat = _etat_synchro()
     if time.time() - etat["dernier"] < INTERVALLE_SYNCHRO:
         return
     existants = fichiers_pdf_existants()
-    if not existants or not etat["verrou"].acquire(blocking=False):
+    if not existants:
+        return
+    modele = charger_modele()  # chargé ici (thread principal), pas dans le thread d'arrière-plan
+    if not etat["verrou"].acquire(blocking=False):
         return
     etat["dernier"] = time.time()
     table = st.secrets.get("SUPABASE_TABLE", "documents")
+    repo, token = st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", "")
 
     def _tache():
         try:
             _appliquer_resultat(etat, synchroniser_index(existants, table))
+            etat["indexation"] = indexer_nouveaux(existants, table, modele, repo, token)
         finally:
             etat["verrou"].release()
 
@@ -689,28 +792,49 @@ with st.sidebar:
 
     if st.session_state.role_utilisateur == "admin":
         with st.expander("🧹 Synchronisation des normes"):
-            st.caption("Les normes supprimées de Hugging Face sont retirées automatiquement des recherches, "
-                       "puis de l'index (vérification au démarrage puis toutes les 6 h).")
+            st.caption("Les normes ajoutées sur Hugging Face sont lues (OCR si scannées) et ajoutées à l'index ; "
+                       "celles supprimées en sont retirées (vérification au démarrage puis toutes les 10 min).")
             table_idx = st.secrets.get("SUPABASE_TABLE", "documents")
             if st.button("Synchroniser maintenant", use_container_width=True):
                 fichiers_pdf_existants.clear()
-                with st.spinner("Synchronisation..."):
-                    r = synchroniser_index(fichiers_pdf_existants(), table_idx)
-                    _appliquer_resultat(_etat_synchro(), r)
-                if r["erreur"]:
-                    st.error(r["erreur"])
-                elif r["echecs"]:
-                    st.warning("Suppression refusée par Supabase (droits insuffisants ?) : "
-                               + ", ".join(r["echecs"]))
-                elif r["supprimes"]:
-                    st.success("Retirées de l'index : " + ", ".join(r["supprimes"]))
+                etat = _etat_synchro()
+                if not etat["verrou"].acquire(blocking=False):
+                    st.info("Une synchronisation est déjà en cours en arrière-plan. Réessayez dans quelques minutes.")
                 else:
-                    st.success("Index déjà à jour.")
+                    try:
+                        with st.spinner("Synchronisation (l'OCR d'une norme scannée peut prendre plusieurs minutes)..."):
+                            existants = fichiers_pdf_existants()
+                            r = synchroniser_index(existants, table_idx)
+                            _appliquer_resultat(etat, r)
+                            ri = indexer_nouveaux(existants, table_idx, charger_modele(),
+                                                  st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", ""))
+                            etat["indexation"] = ri
+                    finally:
+                        etat["verrou"].release()
+                    if r["erreur"]:
+                        st.error(r["erreur"])
+                    if r["echecs"]:
+                        st.warning("Suppression refusée par Supabase (droits insuffisants ?) : " + ", ".join(r["echecs"]))
+                    if r["supprimes"]:
+                        st.success("Retirées de l'index : " + ", ".join(r["supprimes"]))
+                    if ri["erreur"]:
+                        st.error(ri["erreur"])
+                    if ri["indexes"]:
+                        st.success("Ajoutées à l'index : " + ", ".join(ri["indexes"]))
+                    for f, e in ri["echecs"].items():
+                        st.warning(f"Échec d'indexation de {f} : {e}")
+                    if not (r["supprimes"] or ri["indexes"] or ri["echecs"] or r["erreur"] or ri["erreur"]):
+                        st.success("Index déjà à jour.")
             auto = _etat_synchro().get("resultat")
             if auto and auto["supprimes"]:
                 st.caption("Dernier nettoyage auto : " + ", ".join(auto["supprimes"]))
             if auto and (auto["erreur"] or auto["echecs"]):
                 st.caption("⚠️ Nettoyage auto : " + (auto["erreur"] or "suppression refusée (droits Supabase)"))
+            ind = _etat_synchro().get("indexation")
+            if ind and ind["indexes"]:
+                st.caption("Dernière indexation auto : " + ", ".join(ind["indexes"]))
+            if ind and (ind["erreur"] or ind["echecs"]):
+                st.caption("⚠️ Indexation auto : " + (ind["erreur"] or "; ".join(f"{k} ({v})" for k, v in ind["echecs"].items())))
 
     st.markdown("---")
 

@@ -390,8 +390,10 @@ def chemins_indexes(table: str) -> set:
     try:
         r = supabase.rpc("chemins_indexes", {}).execute()
         return {l["chemin"] for l in (r.data or []) if l.get("chemin")}
-    except Exception:
-        pass
+    except Exception as e:
+        msg = str(e)
+        if "PGRST202" not in msg and "Could not find the function" not in msg:
+            raise RuntimeError(f"Fonction SQL chemins_indexes() en erreur : {msg[:250]}")  # vraie cause visible
     chemins, debut = set(), 0
     while True:
         r = supabase.table(table).select("chemin:metadata->>chemin").range(debut, debut + 999).execute()

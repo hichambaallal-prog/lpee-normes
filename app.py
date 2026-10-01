@@ -582,46 +582,102 @@ def lancer_synchro_auto():
     threading.Thread(target=_tache, daemon=True).start()
 
 
+# --- Normes principales : dossier "normes principales" du dépôt Hugging Face ---
+BONUS_PRINCIPALE = 0.04          # avantage de classement donné aux normes principales
+NB_CANDIDATS_PRINCIPALES = 25    # extraits cherchés spécifiquement dans ce dossier
+MOTIF_SQL_PRINCIPALE = "normes_principal%/%"  # '_' = joker : accepte "normes principales" et "normes_principales"
+
+
+def est_principale(chunk) -> bool:
+    """Vrai si le document est dans le dossier « normes principales » (accents/majuscules/_ ignorés)."""
+    chemin = _chemin_norm(chunk)
+    if "/" not in chemin:
+        return False
+    premier = unicodedata.normalize("NFD", chemin.split("/")[0])
+    premier = "".join(ch for ch in premier if unicodedata.category(ch) != "Mn")
+    return premier.lower().replace("_", " ").replace("-", " ").strip().startswith("normes principal")
+
+
+@st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
+def _vecteur_question(question: str):
+    return embed_texte(question, prefixe="query")
+
+
 @st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
 def _candidats(question: str):
-    vecteur = embed_texte(question, prefixe="query")
     res = supabase.rpc("match_documents", {
-        "query_embedding": vecteur,
+        "query_embedding": _vecteur_question(question),
         "match_count": NB_CANDIDATS,
     }).execute()
     return sorted(res.data or [], key=lambda c: c["similarity"], reverse=True)
 
 
-def rechercher_chunks(question: str):
-    """Recherche vectorielle + écarte immédiatement les normes supprimées de Hugging Face
-    + filtrage par pertinence + tri par document/page."""
-    candidats = _candidats(question)
+@st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
+def _candidats_principales(question: str):
+    res = supabase.rpc("match_documents_prefixe", {
+        "query_embedding": _vecteur_question(question),
+        "match_count": NB_CANDIDATS_PRINCIPALES,
+        "motif": MOTIF_SQL_PRINCIPALE,
+    }).execute()
+    return sorted(res.data or [], key=lambda c: c["similarity"], reverse=True)
+
+
+def _principales(question: str, generaux: list) -> list:
+    """Extraits des normes principales. Si la fonction SQL dédiée n'existe pas encore,
+    on se rabat sur ceux déjà présents parmi les candidats généraux."""
+    try:
+        return _candidats_principales(question)
+    except Exception:
+        return [c for c in generaux if est_principale(c)]
+
+
+def rechercher_chunks(question: str, seulement_principales: bool = False):
+    """Recherche vectorielle en deux niveaux : les normes principales sont cherchées à part (et favorisées),
+    puis complétées par le reste de la base (sauf en mode « normes principales uniquement »).
+    Écarte aussi les normes supprimées de Hugging Face."""
+    generaux = _candidats(question)
+    principaux = _principales(question, generaux)
+
+    if seulement_principales:
+        candidats = list(principaux)
+    else:
+        candidats = list(generaux)
+        deja = {(c["metadata"].get("fichier"), c["metadata"].get("page"), c["content"][:120]) for c in candidats}
+        candidats += [c for c in principaux
+                      if (c["metadata"].get("fichier"), c["metadata"].get("page"), c["content"][:120]) not in deja]
+
     existants = fichiers_pdf_existants()
     if existants and layout_coherent():
         candidats = [c for c in candidats if not _chemin_norm(c) or _chemin_norm(c) in existants]
     if not candidats:
         return []
 
-    meilleur = candidats[0]["similarity"]
+    for c in candidats:
+        c["principale"] = est_principale(c)
+        c["score"] = c["similarity"] + (BONUS_PRINCIPALE if c["principale"] else 0.0)
+    candidats.sort(key=lambda c: c["score"], reverse=True)
+
+    meilleur = candidats[0]["score"]
     gardes, vus = [], set()
     for c in candidats:
         cle = (c["metadata"].get("fichier"), c["metadata"].get("page"), c["content"][:120])
         if cle in vus:
             continue  # doublon
         vus.add(cle)
-        if len(gardes) < NB_MIN_RESULTATS or c["similarity"] >= meilleur - ECART_PERTINENCE:
+        if len(gardes) < NB_MIN_RESULTATS or c["score"] >= meilleur - ECART_PERTINENCE:
             gardes.append(c)
         if len(gardes) >= NB_MAX_RESULTATS:
             break
 
-    # Regroupe par document puis page : le modèle lit un texte plus cohérent
-    gardes.sort(key=lambda c: (str(c["metadata"].get("fichier")), c["metadata"].get("page") or 0))
+    # Normes principales en premier, puis regroupement par document et page
+    gardes.sort(key=lambda c: (not c["principale"], str(c["metadata"].get("fichier")), c["metadata"].get("page") or 0))
     return gardes
 
 
 def construire_prompt(question: str, chunks: list, historique: list) -> str:
     contexte_docs = "\n\n---\n\n".join(
-        f"[Source {i+1} — {c['metadata'].get('fichier')}, page {c['metadata'].get('page')}]\n{c['content']}"
+        f"[Source {i+1} — {'NORME PRINCIPALE' if c.get('principale') else 'document complémentaire'} — "
+        f"{c['metadata'].get('fichier')}, page {c['metadata'].get('page')}]\n{c['content']}"
         for i, c in enumerate(chunks)
     )
     derniers = historique[-NB_ECHANGES_CONTEXTE:]
@@ -638,7 +694,11 @@ RÈGLES DE PRÉCISION (impératives) :
    Ne les arrondis pas, ne les convertis pas.
 4. Si des extraits se contredisent (versions/normes différentes), signale-le et cite chaque source.
 5. Cite chaque affirmation avec (Source X) — fichier et page.
-6. Termine par une section « Points non couverts » listant ce que les extraits ne permettent pas de confirmer.
+6. PRIORITÉ AUX NORMES PRINCIPALES : les extraits « NORME PRINCIPALE » font référence. Appuie-toi d'abord sur eux.
+   N'utilise un « document complémentaire » que pour compléter, et précise-le (« d'après un document complémentaire »).
+   En cas de divergence, la norme principale prévaut ; signale l'écart. Si aucun extrait de norme principale
+   ne traite la question, dis-le dans ta première phrase.
+7. Termine par une section « Points non couverts » listant ce que les extraits ne permettent pas de confirmer.
    Ne devine jamais.
 
 FORMAT : commence directement par la réponse (pas d'introduction), puis sections courtes avec puces ;
@@ -711,7 +771,8 @@ def afficher_sources(chunks: list, prefixe_cle: str):
             if _supprime(c):
                 continue
             meta = c["metadata"]
-            st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} (pertinence : {c['similarity']:.0%})")
+            etiquette = "⭐ Norme principale" if c.get("principale") else "Complémentaire"
+            st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} · {etiquette} (pertinence : {c['similarity']:.0%})")
             st.caption(c["content"])
             st.divider()
 
@@ -1003,6 +1064,12 @@ st.subheader(f"👋 Bonjour {st.session_state.nom_utilisateur}")
 st.caption(f"Session active : **{st.session_state.session_courante}** — Posez une question, puis enchaînez des questions de suivi si besoin.")
 
 col_titre, col_bouton = st.columns([5, 1])
+with col_titre:
+    seulement_principales = st.checkbox(
+        "🎯 Chercher uniquement dans les normes principales",
+        key="seulement_principales",
+        help="Décochée : les normes principales sont consultées en priorité, puis complétées par les autres documents.",
+    )
 with col_bouton:
     if st.button("🗑️ Vider", use_container_width=True):
         st.session_state.sessions[st.session_state.session_courante] = []
@@ -1026,11 +1093,16 @@ if question:
         t0 = time.time()
         with st.spinner("Recherche dans les documents indexés..."):
             question_recherche = reformuler_question(question, historique[:-1])
-            chunks = rechercher_chunks(question_recherche)
+            chunks = rechercher_chunks(question_recherche, seulement_principales)
         t_recherche = time.time() - t0
 
         if not chunks:
-            reponse = "Aucun document pertinent trouvé pour cette question. Reformulez-la, ou vérifiez que l'indexation a bien été exécutée."
+            reponse = (
+                "Aucun passage trouvé dans les **normes principales** pour cette question. "
+                "Décochez « Chercher uniquement dans les normes principales » pour élargir la recherche."
+                if seulement_principales else
+                "Aucun document pertinent trouvé pour cette question. Reformulez-la, ou vérifiez que l'indexation a bien été exécutée."
+            )
             st.markdown(reponse)
             historique.append({"role": "assistant", "content": reponse, "sources": []})
             sauvegarder_historique()

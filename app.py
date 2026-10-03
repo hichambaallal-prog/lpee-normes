@@ -486,7 +486,7 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str, suivi=No
             for idx, morceau in enumerate(_decouper(texte)):
                 cid = f"{num}-{idx}"
                 lignes.append({
-                    "content": morceau, "fichier": nom, "chunk_id": cid,
+                    "content": morceau, "fichier": chemin, "chunk_id": cid,  # clé unique = chemin complet (deux PDF de même nom ne s'écrasent plus)
                     "metadata": {"fichier": nom, "chemin": chemin, "page": num, "chunk_id": cid},
                 })
     if not lignes:
@@ -511,7 +511,19 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str, suivi=No
     return len(lignes)
 
 
-def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemins_db=None, suivi=None) -> dict:
+SEUIL_BASE_MO = 450            # au-delà, l'indexation s'arrête (limite gratuite Supabase : 500 Mo)
+MAX_FICHIERS_PAR_PASSE = 5     # indexation automatique : au plus 5 PDF par passage (le CPU Streamlit Cloud est limité)
+
+
+def _taille_base_directe():
+    try:
+        return int(supabase.rpc("taille_base", {}).execute().data) / 1048576
+    except Exception:
+        return None
+
+
+def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemins_db=None, suivi=None,
+                     maximum=None) -> dict:
     """Indexe les PDF présents sur Hugging Face mais absents de l'index Supabase."""
     res = {"indexes": [], "echecs": {}, "erreur": None}
     if not existants:
@@ -521,7 +533,15 @@ def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemi
     except Exception as e:
         res["erreur"] = str(e)[:300]
         return res
-    for chemin in sorted(set(existants) - deja):
+    a_faire = sorted(set(existants) - deja)
+    if maximum:
+        a_faire = a_faire[:maximum]
+    for chemin in a_faire:
+        mo = _taille_base_directe()
+        if mo is not None and mo >= SEUIL_BASE_MO:
+            res["erreur"] = (f"Indexation suspendue : la base fait {mo:.0f} Mo (seuil {SEUIL_BASE_MO} Mo sur 500). "
+                             "Libérez de l'espace ou passez à l'offre Pro.")
+            break
         try:
             n = indexer_pdf(chemin, table, modele, repo, token, suivi)
             res["indexes"].append(f"{chemin} ({n} extraits)")
@@ -560,6 +580,9 @@ def lancer_synchro_auto():
     etat["dernier"] = time.time()
     table = st.secrets.get("SUPABASE_TABLE", "documents")
     repo, token = st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", "")
+    # INDEXATION_AUTO = "false" dans les secrets : pas d'indexation automatique (utile pendant une
+    # indexation massive avec ingest.py sur votre PC, pour éviter que les deux travaillent en même temps)
+    auto = str(st.secrets.get("INDEXATION_AUTO", "true")).strip().lower() not in ("false", "0", "non", "no")
 
     def _tache():
         try:
@@ -571,7 +594,12 @@ def lancer_synchro_auto():
                 en_base = None
             etat["progression"] = "nettoyage des normes supprimées"
             _appliquer_resultat(etat, synchroniser_index(existants, table, en_base))
-            etat["indexation"] = indexer_nouveaux(existants, table, modele, repo, token, en_base, etat)
+            if auto:
+                etat["indexation"] = indexer_nouveaux(existants, table, modele, repo, token, en_base, etat,
+                                                      maximum=MAX_FICHIERS_PAR_PASSE)
+            else:
+                etat["indexation"] = {"indexes": [], "echecs": {}, "erreur":
+                                      "Indexation automatique désactivée (secret INDEXATION_AUTO = false)."}
         finally:
             etat["progression"] = None
             etat["verrou"].release()

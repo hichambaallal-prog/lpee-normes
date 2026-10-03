@@ -31,6 +31,7 @@ from supabase import create_client
 from google import genai
 from google.genai import types
 from sentence_transformers import SentenceTransformer
+from postgrest.exceptions import APIError  # noqa: F401  (erreurs Supabase lisibles)
 
 st.set_page_config(page_title="Recherche Normes LPEE", page_icon="📚", layout="wide")
 
@@ -219,10 +220,6 @@ NB_ECHANGES_CONTEXTE = 4
 client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-import io
-import json
-import re
-
 
 def _chemin_historique(username: str) -> str:
     return f"historiques/{re.sub(r'[^a-z0-9_-]', '_', username.lower())}.json"
@@ -340,7 +337,7 @@ Réponds UNIQUEMENT par la question reformulée, sans guillemets ni commentaire.
 # ==========================================
 # SYNCHRONISATION HUGGING FACE -> INDEX (suppression automatique des normes retirées)
 # ==========================================
-INTERVALLE_SYNCHRO = 30 * 60  # ajouts + suppressions vérifiés toutes les 30 min (et au démarrage)
+INTERVALLE_SYNCHRO = 3 * 60 * 60  # ajouts + suppressions vérifiés toutes les 3 h (et au démarrage) : économise CPU et base
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -373,7 +370,7 @@ def layout_coherent() -> bool:
         return False
     table = st.secrets.get("SUPABASE_TABLE", "documents")
     chemins = []
-    for debut in (0, 3000, 10000, 30000, 80000):
+    for debut in (0, 3000, 10000):
         try:
             r = supabase.table(table).select("chemin:metadata->>chemin").range(debut, debut + 59).execute()
             chemins += [l["chemin"] for l in (r.data or []) if l.get("chemin")]
@@ -598,6 +595,38 @@ def est_principale(chunk) -> bool:
     return premier.lower().replace("_", " ").replace("-", " ").strip().startswith("normes principal")
 
 
+def _rpc(nom: str, params: dict, essais: int = 2):
+    """Appel RPC Supabase : une 2e tentative en cas de délai dépassé / saturation,
+    sinon une erreur LISIBLE (Streamlit Cloud masque le message d'origine de APIError)."""
+    derniere = None
+    for tentative in range(essais):
+        try:
+            return supabase.rpc(nom, params).execute()
+        except Exception as e:
+            derniere = e
+            code = str(getattr(e, "code", "") or "")
+            msg = str(getattr(e, "message", "") or e)
+            temporaire = code in ("57014", "53300", "54000", "PGRST003") or "timeout" in msg.lower()
+            if tentative + 1 < essais and temporaire:
+                time.sleep(1.5)
+                continue
+            break
+    code = str(getattr(derniere, "code", "") or "")
+    details = " | ".join(str(x) for x in (getattr(derniere, "message", None) or derniere,
+                                          getattr(derniere, "details", None),
+                                          getattr(derniere, "hint", None)) if x)
+    raise RuntimeError(f"Supabase · fonction « {nom} » · code {code or 'n/a'} · {details}"[:700])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def taille_base_mo():
+    """Taille de la base en Mo (fonction SQL taille_base()), None si indisponible."""
+    try:
+        return int(_rpc("taille_base", {}, essais=1).data) / 1048576
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
 def _vecteur_question(question: str):
     return embed_texte(question, prefixe="query")
@@ -605,20 +634,20 @@ def _vecteur_question(question: str):
 
 @st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
 def _candidats(question: str):
-    res = supabase.rpc("match_documents", {
+    res = _rpc("match_documents", {
         "query_embedding": _vecteur_question(question),
         "match_count": NB_CANDIDATS,
-    }).execute()
+    })
     return sorted(res.data or [], key=lambda c: c["similarity"], reverse=True)
 
 
 @st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
 def _candidats_principales(question: str):
-    res = supabase.rpc("match_documents_prefixe", {
+    res = _rpc("match_documents_prefixe", {
         "query_embedding": _vecteur_question(question),
         "match_count": NB_CANDIDATS_PRINCIPALES,
         "motif": MOTIF_SQL_PRINCIPALE,
-    }).execute()
+    })
     return sorted(res.data or [], key=lambda c: c["similarity"], reverse=True)
 
 
@@ -875,8 +904,17 @@ with st.sidebar:
     if st.session_state.role_utilisateur == "admin":
         with st.expander("🧹 Synchronisation des normes"):
             st.caption("Les normes ajoutées sur Hugging Face sont lues (OCR si scannées) et ajoutées à l'index ; "
-                       "celles supprimées en sont retirées (vérification au démarrage puis toutes les 30 min).")
+                       "celles supprimées en sont retirées (vérification au démarrage puis toutes les 3 h).")
             table_idx = st.secrets.get("SUPABASE_TABLE", "documents")
+            _mo = taille_base_mo()
+            if _mo is not None:
+                _txt = f"💾 Taille de la base : {_mo:.0f} Mo / 500 Mo (offre gratuite)"
+                if _mo >= 500:
+                    st.error(_txt + " — base en lecture seule : supprimez des données.")
+                elif _mo >= 450:
+                    st.warning(_txt)
+                else:
+                    st.caption(_txt)
             _prog = _etat_synchro().get("progression")
             if _prog:
                 _duree = int((time.time() - _etat_synchro().get("debut", time.time())) / 60)
@@ -1091,9 +1129,23 @@ if question:
 
     with st.chat_message("assistant"):
         t0 = time.time()
-        with st.spinner("Recherche dans les documents indexés..."):
-            question_recherche = reformuler_question(question, historique[:-1])
-            chunks = rechercher_chunks(question_recherche, seulement_principales)
+        try:
+            with st.spinner("Recherche dans les documents indexés..."):
+                question_recherche = reformuler_question(question, historique[:-1])
+                chunks = rechercher_chunks(question_recherche, seulement_principales)
+        except Exception as e:
+            historique.pop()  # la question n'a pas reçu de réponse : on ne la garde pas dans l'historique
+            detail = str(e)
+            st.error("⚠️ La recherche dans la base a échoué. Réessayez dans un instant.")
+            st.code(detail[:700], language=None)
+            if "57014" in detail or "timeout" in detail.lower():
+                st.info("Délai dépassé côté Supabase : exécutez `optimisation_supabase.sql` "
+                        "(index + délai d'exécution) et vérifiez que la base reste sous 500 Mo.")
+            elif "PGRST202" in detail or "Could not find" in detail:
+                st.info("Fonction SQL absente : exécutez `optimisation_supabase.sql` dans Supabase > SQL Editor.")
+            elif "read-only" in detail.lower():
+                st.info("Base en lecture seule (quota de 500 Mo dépassé) : libérez de l'espace.")
+            st.stop()
         t_recherche = time.time() - t0
 
         if not chunks:

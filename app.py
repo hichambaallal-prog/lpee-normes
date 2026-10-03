@@ -618,6 +618,16 @@ def _rpc(nom: str, params: dict, essais: int = 2):
     raise RuntimeError(f"Supabase · fonction « {nom} » · code {code or 'n/a'} · {details}"[:700])
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def nb_extraits():
+    """Nombre de lignes dans la table des extraits, None si indisponible."""
+    try:
+        table = st.secrets.get("SUPABASE_TABLE", "documents")
+        return supabase.table(table).select("id", count="exact").limit(1).execute().count
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def taille_base_mo():
     """Taille de la base en Mo (fonction SQL taille_base()), None si indisponible."""
@@ -638,7 +648,11 @@ def _candidats(question: str):
         "query_embedding": _vecteur_question(question),
         "match_count": NB_CANDIDATS,
     })
-    return sorted(res.data or [], key=lambda c: c["similarity"], reverse=True)
+    if not res.data:
+        # Une exception n'est PAS mise en cache par Streamlit (contrairement à une liste vide gardée 1 h)
+        raise LookupError("La fonction match_documents n'a renvoyé aucun extrait : la table est vide, "
+                          "ou l'index/la fonction SQL ne trouve rien (voir optimisation_supabase.sql).")
+    return sorted(res.data, key=lambda c: c["similarity"], reverse=True)
 
 
 @st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
@@ -906,6 +920,10 @@ with st.sidebar:
             st.caption("Les normes ajoutées sur Hugging Face sont lues (OCR si scannées) et ajoutées à l'index ; "
                        "celles supprimées en sont retirées (vérification au démarrage puis toutes les 3 h).")
             table_idx = st.secrets.get("SUPABASE_TABLE", "documents")
+            _n = nb_extraits()
+            if _n is not None:
+                (st.error if _n == 0 else st.caption)(f"📚 {_n:,} extraits indexés".replace(",", " ")
+                                                       + (" — la base est VIDE : relancez l'indexation (ingest.py)." if _n == 0 else ""))
             _mo = taille_base_mo()
             if _mo is not None:
                 _txt = f"💾 Taille de la base : {_mo:.0f} Mo / 500 Mo (offre gratuite)"
@@ -1141,6 +1159,8 @@ if question:
             if "57014" in detail or "timeout" in detail.lower():
                 st.info("Délai dépassé côté Supabase : exécutez `optimisation_supabase.sql` "
                         "(index + délai d'exécution) et vérifiez que la base reste sous 500 Mo.")
+            elif "aucun extrait" in detail:
+                st.info("Vérifiez dans Supabase : `select count(*), count(embedding) from documents;`")
             elif "PGRST202" in detail or "Could not find" in detail:
                 st.info("Fonction SQL absente : exécutez `optimisation_supabase.sql` dans Supabase > SQL Editor.")
             elif "read-only" in detail.lower():

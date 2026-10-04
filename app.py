@@ -370,6 +370,12 @@ def _norm_chemin(chemin) -> str:
     return unicodedata.normalize("NFC", str(chemin or "")).replace("\\", "/")
 
 
+def _sans_accents(texte: str) -> str:
+    """Minuscules sans accents (pour comparer « chaussee » et « Chaussée »)."""
+    t = unicodedata.normalize("NFD", str(texte or "").lower())
+    return "".join(c for c in t if unicodedata.category(c) != "Mn")
+
+
 def _chemin_norm(chunk) -> str:
     return _norm_chemin(chunk["metadata"].get("chemin"))
 
@@ -1128,8 +1134,8 @@ with st.sidebar:
                         except Exception as e:
                             _base_t = set()
                             st.error("Lecture de l'index impossible : " + str(e)[:200])
-                        _mots = _norm_chemin(_nom_test).lower().split()
-                        _trouves = sorted(c for c in _ex_t if all(m in c.lower() for m in _mots))
+                        _mots = _sans_accents(_norm_chemin(_nom_test)).split()
+                        _trouves = sorted(c for c in _ex_t if all(m in _sans_accents(c) for m in _mots))
                         _aut_t = _dossiers_autorises()
                         if not _trouves:
                             st.warning(f"Aucun PDF correspondant sur Hugging Face (dépôt « {st.secrets.get('HF_REPO_ID', '?')} », "

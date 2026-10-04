@@ -515,6 +515,99 @@ SEUIL_BASE_MO = 450            # au-delà, l'indexation s'arrête (limite gratui
 MAX_FICHIERS_PAR_PASSE = 5     # indexation automatique : au plus 5 PDF par passage (le CPU Streamlit Cloud est limité)
 
 
+FICHIER_REGLAGES = "reglages_indexation.json"   # stocké dans le dépôt Hugging Face, comme utilisateurs.json
+_LIRE = object()
+
+
+def _lire_reglages():
+    """Réglages d'indexation enregistrés sur Hugging Face : {"tous": bool, "dossiers": [...]}.
+    None = aucun réglage enregistré (=> tous les dossiers). En cas d'erreur de lecture : on n'indexe RIEN (sécurité)."""
+    repo, token = st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", "")
+    if not (repo and token):
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.utils import EntryNotFoundError, RevisionNotFoundError
+        try:
+            chemin = hf_hub_download(repo_id=repo, filename=FICHIER_REGLAGES, repo_type="dataset",
+                                     token=token, force_download=True)
+        except (EntryNotFoundError, RevisionNotFoundError):
+            return None
+        with open(chemin, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"tous": False, "dossiers": [], "erreur": True}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def charger_reglages():
+    return _lire_reglages()
+
+
+def sauver_reglages(reglages: dict):
+    repo, token = st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", "")
+    if not (repo and token):
+        return False, "HF_REPO_ID / HF_TOKEN manquants."
+    try:
+        from huggingface_hub import HfApi
+        HfApi(token=token).upload_file(
+            path_or_fileobj=io.BytesIO(json.dumps(reglages, ensure_ascii=False, indent=1).encode("utf-8")),
+            path_in_repo=FICHIER_REGLAGES, repo_id=repo, repo_type="dataset",
+            commit_message="Mise à jour des dossiers à indexer",
+        )
+        charger_reglages.clear()
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:300]
+
+
+def _secret_dossiers():
+    """Secret DOSSIERS_INDEXES (liste TOML ou texte séparé par « ; »). "*" = tous. Prioritaire sur les réglages."""
+    try:
+        brut = st.secrets.get("DOSSIERS_INDEXES", "")
+    except Exception:
+        return None
+    liste = [str(x) for x in brut] if isinstance(brut, (list, tuple)) else str(brut).replace("|", ";").split(";")
+    liste = [x.strip() for x in liste if x.strip()]
+    return liste or None
+
+
+def _dossiers_autorises(reg=_LIRE):
+    """None = tous les dossiers ; sinon liste (éventuellement vide) des dossiers que l'application peut indexer."""
+    liste = _secret_dossiers()
+    if liste:
+        return None if "*" in liste else [_norm_chemin(x).strip("/").lower() for x in liste]
+    if reg is _LIRE:
+        reg = _lire_reglages()
+    if reg is None or reg.get("tous"):
+        return None
+    return [_norm_chemin(x).strip("/").lower() for x in reg.get("dossiers", [])]
+
+
+def _autorise(chemin, autorises) -> bool:
+    return autorises is None or any(_norm_chemin(chemin).lower().startswith(d + "/") for d in autorises)
+
+
+def _dossier_racine(chemin):
+    c = _norm_chemin(chemin)
+    return c.split("/")[0] if "/" in c else None
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def stats_dossiers_indexes(table: str) -> dict:
+    """Nombre de PDF indexés par dossier de premier niveau."""
+    try:
+        chemins = chemins_indexes(table)
+    except Exception:
+        return {}
+    d = {}
+    for c in chemins:
+        k = _dossier_racine(c)
+        if k:
+            d[k] = d.get(k, 0) + 1
+    return d
+
+
 def _taille_base_directe():
     try:
         return int(supabase.rpc("taille_base", {}).execute().data) / 1048576
@@ -534,6 +627,9 @@ def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemi
         res["erreur"] = str(e)[:300]
         return res
     a_faire = sorted(set(existants) - deja)
+    autorises = _dossiers_autorises()
+    if autorises is not None:
+        a_faire = [c for c in a_faire if _autorise(c, autorises)]
     if maximum:
         a_faire = a_faire[:maximum]
     for chemin in a_faire:
@@ -679,7 +775,7 @@ def _candidats(question: str):
     if not res.data:
         # Une exception n'est PAS mise en cache par Streamlit (contrairement à une liste vide gardée 1 h)
         raise LookupError("La fonction match_documents n'a renvoyé aucun extrait : la table est vide, "
-                          "ou l'index/la fonction SQL ne trouve rien (voir optimisation_supabase.sql).")
+                          "ou l'index/la fonction SQL ne trouve rien (voir schema.sql).")
     return sorted(res.data, key=lambda c: c["similarity"], reverse=True)
 
 
@@ -948,6 +1044,43 @@ with st.sidebar:
             st.caption("Les normes ajoutées sur Hugging Face sont lues (OCR si scannées) et ajoutées à l'index ; "
                        "celles supprimées en sont retirées (vérification au démarrage puis toutes les 3 h).")
             table_idx = st.secrets.get("SUPABASE_TABLE", "documents")
+            _reg = charger_reglages()
+            _aut = _dossiers_autorises(_reg)
+            if _reg is not None and _reg.get("erreur"):
+                st.error("Réglages d'indexation illisibles (Hugging Face) : aucune indexation par sécurité.")
+            elif _aut is None:
+                st.caption("📂 Indexation : tous les dossiers de Hugging Face")
+            elif not _aut:
+                st.warning("📂 Aucun dossier sélectionné : rien ne sera indexé.")
+            else:
+                st.caption("📂 Indexation limitée à : " + " · ".join(_aut))
+            _ex_ui = fichiers_pdf_existants()
+            if _secret_dossiers():
+                st.info("Les dossiers à indexer sont imposés par le secret DOSSIERS_INDEXES "
+                        "(supprimez-le des secrets pour choisir ici).")
+            elif _ex_ui:
+                _tot = {}
+                for _f in _ex_ui:
+                    _k = _dossier_racine(_f)
+                    if _k:
+                        _tot[_k] = _tot.get(_k, 0) + 1
+                _idx = stats_dossiers_indexes(table_idx)
+                _opts = sorted(_tot, key=str.lower)
+                with st.container(border=True):
+                    st.markdown("**📂 Dossiers à indexer**")
+                    _tous = st.checkbox("Tous les dossiers", value=(_reg is None or bool(_reg.get("tous"))),
+                                        key="reg_tous")
+                    _defaut = [d for d in (_reg or {}).get("dossiers", []) if d in _opts]
+                    _choix = st.multiselect("Dossiers", _opts, default=_defaut, disabled=_tous, key="reg_dossiers",
+                                            format_func=lambda d: f"{d} — {_idx.get(d, 0)}/{_tot[d]} indexés",
+                                            placeholder="Choisissez un ou plusieurs dossiers")
+                    if st.button("💾 Enregistrer la sélection", use_container_width=True, key="reg_save"):
+                        ok, msg = sauver_reglages({"tous": bool(_tous), "dossiers": [] if _tous else list(_choix)})
+                        if ok:
+                            st.success("Sélection enregistrée. Cliquez sur « Synchroniser maintenant » pour lancer l'indexation.")
+                        else:
+                            st.error("Enregistrement impossible : " + msg)
+                    st.caption("Les dossiers déjà indexés qui ne sont plus cochés restent dans la base.")
             _n = nb_extraits()
             if _n is not None:
                 (st.error if _n == 0 else st.caption)(f"📚 {_n:,} extraits indexés".replace(",", " ")
@@ -973,17 +1106,21 @@ with st.sidebar:
                 else:
                     try:
                         _en_base = {_norm_chemin(c) for c in chemins_indexes(table_idx)}
-                        _manq = sorted(set(_ex) - _en_base)
-                        st.write(f"{len(_ex)} PDF sur Hugging Face · {len(set(_ex) & _en_base)} indexés")
+                        _aut_now = _dossiers_autorises()
+                        _ex_f = {c for c in _ex if _autorise(c, _aut_now)}
+                        _manq = sorted(_ex_f - _en_base)
+                        st.write(f"{len(_ex)} PDF sur Hugging Face · {len(_ex_f)} dans les dossiers sélectionnés · "
+                                 f"{len(_ex_f & _en_base)} indexés")
                         if _manq:
-                            st.warning("Pas encore indexés : " + ", ".join(_manq))
+                            st.warning(f"Pas encore indexés ({len(_manq)}) : " + ", ".join(_manq[:30])
+                                       + (" …" if len(_manq) > 30 else ""))
                         else:
-                            st.success("Tous les PDF du dépôt sont indexés.")
+                            st.success("Tous les PDF des dossiers sélectionnés sont indexés.")
                     except Exception as _e:
                         st.error(f"Lecture de l'index impossible : {str(_e)[:300]}")
                         if "57014" in str(_e) or "timeout" in str(_e).lower():
                             st.info("L'index Supabase est trop lent à lire : exécutez le script "
-                                    "optimisation_supabase.sql dans Supabase > SQL Editor.")
+                                    "schema.sql dans Supabase > SQL Editor.")
             if st.button("Synchroniser maintenant", use_container_width=True):
                 fichiers_pdf_existants.clear()
                 etat = _etat_synchro()
@@ -1185,12 +1322,12 @@ if question:
             st.error("⚠️ La recherche dans la base a échoué. Réessayez dans un instant.")
             st.code(detail[:700], language=None)
             if "57014" in detail or "timeout" in detail.lower():
-                st.info("Délai dépassé côté Supabase : exécutez `optimisation_supabase.sql` "
+                st.info("Délai dépassé côté Supabase : exécutez `schema.sql` "
                         "(index + délai d'exécution) et vérifiez que la base reste sous 500 Mo.")
             elif "aucun extrait" in detail:
                 st.info("Vérifiez dans Supabase : `select count(*), count(embedding) from documents;`")
             elif "PGRST202" in detail or "Could not find" in detail:
-                st.info("Fonction SQL absente : exécutez `optimisation_supabase.sql` dans Supabase > SQL Editor.")
+                st.info("Fonction SQL absente : exécutez `schema.sql` dans Supabase > SQL Editor.")
             elif "read-only" in detail.lower():
                 st.info("Base en lecture seule (quota de 500 Mo dépassé) : libérez de l'espace.")
             st.stop()

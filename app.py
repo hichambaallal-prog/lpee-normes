@@ -139,12 +139,25 @@ def lire_jeton(jeton: str, users: dict):
         return None
 
 
+def lire_cookie(controller, nom: str):
+    """Lit un cookie sans jamais planter : au 1er affichage, le composant n'a pas encore reçu les
+    cookies du navigateur (sa liste interne vaut None => TypeError selon la version de la bibliothèque).
+    On renvoie alors None ; dès que le navigateur répond, l'application se relance et le cookie est lu."""
+    try:
+        return controller.get(nom)
+    except (TypeError, AttributeError, KeyError):
+        return None
+
+
 def poser_cookie(controller, login: str, empreinte_mdp: str):
-    controller.set(
-        COOKIE_NOM, creer_jeton(login, empreinte_mdp),
-        expires=datetime.now() + timedelta(days=DUREE_COOKIE_JOURS),
-        max_age=DUREE_COOKIE_JOURS * 86400, same_site="lax",
-    )
+    try:
+        controller.set(
+            COOKIE_NOM, creer_jeton(login, empreinte_mdp),
+            expires=datetime.now() + timedelta(days=DUREE_COOKIE_JOURS),
+            max_age=DUREE_COOKIE_JOURS * 86400, same_site="lax",
+        )
+    except (TypeError, AttributeError):
+        pass  # connexion valide pour la session ; seul le « rester connecté » est ignoré
 
 
 if "authentifie" not in st.session_state:
@@ -159,7 +172,7 @@ if "role_utilisateur" not in st.session_state:
 controller = CookieController()
 
 if not st.session_state.authentifie and not st.session_state.get("deconnexion_volontaire"):
-    _jeton = controller.get(COOKIE_NOM)
+    _jeton = lire_cookie(controller, COOKIE_NOM)
     if _jeton:
         _users = charger_utilisateurs()
         _login = lire_jeton(_jeton, _users) if _users else None
@@ -1004,7 +1017,10 @@ with st.sidebar:
             st.session_state.pop(k, None)
         st.session_state.deconnexion_volontaire = True
         try:
-            controller.remove(COOKIE_NOM)
+            try:
+                controller.remove(COOKIE_NOM)
+            except (TypeError, AttributeError, KeyError):
+                pass
         except Exception:
             pass
         time.sleep(0.7)

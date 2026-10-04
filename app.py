@@ -1114,6 +1114,34 @@ with st.sidebar:
             if _prog:
                 _duree = int((time.time() - _etat_synchro().get("debut", time.time())) / 60)
                 st.info(f"⏳ Indexation en cours (depuis {_duree} min) : " + _prog)
+            with st.expander("🔎 Tester un fichier"):
+                _nom_test = st.text_input("Nom (ou partie du nom) du PDF", key="diag_nom",
+                                          placeholder="ex : catalogue structures chaussées")
+                if _nom_test.strip():
+                    fichiers_pdf_existants.clear()
+                    _ex_t = fichiers_pdf_existants()
+                    if not _ex_t:
+                        st.error("Liste des PDF Hugging Face indisponible (vérifiez HF_REPO_ID / HF_TOKEN).")
+                    else:
+                        try:
+                            _base_t = {_norm_chemin(c) for c in chemins_indexes(table_idx)}
+                        except Exception as e:
+                            _base_t = set()
+                            st.error("Lecture de l'index impossible : " + str(e)[:200])
+                        _mots = _norm_chemin(_nom_test).lower().split()
+                        _trouves = sorted(c for c in _ex_t if all(m in c.lower() for m in _mots))
+                        _aut_t = _dossiers_autorises()
+                        if not _trouves:
+                            st.warning(f"Aucun PDF correspondant sur Hugging Face (dépôt « {st.secrets.get('HF_REPO_ID', '?')} », "
+                                       f"{len(_ex_t)} PDF listés). Le fichier n'a pas été envoyé dans ce dépôt, "
+                                       "ou son nom est différent : relancez upload_pdfs.py et vérifiez le nom sur le site.")
+                        for _c in _trouves[:15]:
+                            if _c in _base_t:
+                                st.success(f"✅ Indexé — {_c}")
+                            elif not _autorise(_c, _aut_t):
+                                st.info(f"🚫 Sur Hugging Face mais son dossier n'est pas sélectionné — {_c}")
+                            else:
+                                st.warning(f"⏳ Sur Hugging Face, pas encore indexé (cliquez sur « Synchroniser maintenant ») — {_c}")
             if st.button("Vérifier l'état de l'index", use_container_width=True):
                 fichiers_pdf_existants.clear()
                 _ex = fichiers_pdf_existants()

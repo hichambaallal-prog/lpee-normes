@@ -532,6 +532,14 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str, suivi=No
 
 SEUIL_BASE_MO = 450            # au-delà, l'indexation s'arrête (limite gratuite Supabase : 500 Mo)
 MAX_FICHIERS_PAR_PASSE = 5     # indexation automatique : au plus 5 PDF par passage (le CPU Streamlit Cloud est limité)
+MAX_FICHIERS_MANUEL = 8        # bouton « Synchroniser maintenant » : au plus 8 PDF par clic (secret MAX_FICHIERS_SYNCHRO pour changer)
+
+
+def _max_manuel() -> int:
+    try:
+        return max(1, int(st.secrets.get("MAX_FICHIERS_SYNCHRO", MAX_FICHIERS_MANUEL)))
+    except Exception:
+        return MAX_FICHIERS_MANUEL
 
 
 FICHIER_REGLAGES = "reglages_indexation.json"   # stocké dans le dépôt Hugging Face, comme utilisateurs.json
@@ -637,7 +645,7 @@ def _taille_base_directe():
 def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemins_db=None, suivi=None,
                      maximum=None) -> dict:
     """Indexe les PDF présents sur Hugging Face mais absents de l'index Supabase."""
-    res = {"indexes": [], "echecs": {}, "erreur": None}
+    res = {"indexes": [], "echecs": {}, "erreur": None, "restants": 0}
     if not existants:
         return res
     try:
@@ -649,19 +657,29 @@ def indexer_nouveaux(existants, table: str, modele, repo: str, token: str, chemi
     autorises = _dossiers_autorises()
     if autorises is not None:
         a_faire = [c for c in a_faire if _autorise(c, autorises)]
+    connus = (suivi or {}).get("echecs_connus", {})
+    a_faire.sort(key=lambda c: c in connus)  # les fichiers déjà en échec passent en dernier : ils ne bloquent pas la file
+    total_a_faire = len(a_faire)
     if maximum:
         a_faire = a_faire[:maximum]
+    traites = 0
     for chemin in a_faire:
         mo = _taille_base_directe()
         if mo is not None and mo >= SEUIL_BASE_MO:
             res["erreur"] = (f"Indexation suspendue : la base fait {mo:.0f} Mo (seuil {SEUIL_BASE_MO} Mo sur 500). "
                              "Libérez de l'espace ou passez à l'offre Pro.")
             break
+        traites += 1
         try:
             n = indexer_pdf(chemin, table, modele, repo, token, suivi)
             res["indexes"].append(f"{chemin} ({n} extraits)")
+            if suivi is not None:
+                suivi.setdefault("echecs_connus", {}).pop(chemin, None)
         except Exception as e:
             res["echecs"][chemin] = str(e)[:200]
+            if suivi is not None:
+                suivi.setdefault("echecs_connus", {})[chemin] = str(e)[:200]
+    res["restants"] = max(0, total_a_faire - len(res["indexes"]) - len(res["echecs"]))
     if suivi is not None:
         suivi["progression"] = None
     if res["indexes"]:
@@ -1186,7 +1204,7 @@ with st.sidebar:
                             _appliquer_resultat(etat, r)
                             ri = indexer_nouveaux(existants, table_idx, charger_modele(),
                                                   st.secrets.get("HF_REPO_ID", ""), st.secrets.get("HF_TOKEN", ""),
-                                                  suivi=etat)
+                                                  suivi=etat, maximum=_max_manuel())
                             etat["indexation"] = ri
                     finally:
                         etat["verrou"].release()
@@ -1202,6 +1220,10 @@ with st.sidebar:
                         st.success("Ajoutées à l'index : " + ", ".join(ri["indexes"]))
                     for f, e in ri["echecs"].items():
                         st.warning(f"Échec d'indexation de {f} : {e}")
+                    if ri.get("restants"):
+                        st.info(f"📦 Il reste {ri['restants']} PDF à indexer dans les dossiers sélectionnés. "
+                                f"Patientez un moment puis cliquez de nouveau sur « Synchroniser maintenant » "
+                                f"(par lots de {_max_manuel()} pour ne pas surcharger le serveur).")
                     if not (r["supprimes"] or ri["indexes"] or ri["echecs"] or r["erreur"] or ri["erreur"]):
                         st.success("Index déjà à jour.")
             auto = _etat_synchro().get("resultat")

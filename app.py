@@ -379,10 +379,22 @@ CSS_IA = """
 /* Barre latérale : liseré néon */
 [data-testid="stSidebar"] {border-right:1px solid rgba(124,58,237,.35);box-shadow:4px 0 22px rgba(99,102,241,.15);}
 
-/* Indicateur de réflexion (spinner) : texte avec reflet qui défile */
-[data-testid="stSpinner"] {background:linear-gradient(90deg,currentColor 35%,#7c3aed 50%,currentColor 65%);
-  background-size:200% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
-  animation:ia-reflet 2s linear infinite;}
+/* Indicateur « l'IA réfléchit » (toujours visible pendant la recherche et la rédaction) */
+@keyframes ia-onde  {0%{transform:scale(.6);opacity:.9}100%{transform:scale(2.1);opacity:0}}
+@keyframes ia-rail  {0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
+@keyframes ia-points{0%,20%{content:"."}40%{content:".."}60%,100%{content:"..."}}
+.ia-penser {display:flex;align-items:center;gap:16px;padding:10px 4px;}
+.ia-penser .orbe {position:relative;flex:none;width:34px;height:34px;border-radius:50%;
+  background:radial-gradient(circle at 30% 30%,#a78bfa,#4f46e5);box-shadow:0 0 16px rgba(99,102,241,.8);}
+.ia-penser .orbe::before,.ia-penser .orbe::after {content:"";position:absolute;inset:0;border-radius:50%;
+  border:2px solid #22d3ee;animation:ia-onde 1.8s ease-out infinite;}
+.ia-penser .orbe::after {animation-delay:.9s;border-color:#a78bfa;}
+.ia-penser .titre {font-weight:700;}
+.ia-penser .titre::after {content:"...";animation:ia-points 1.4s steps(1) infinite;display:inline-block;width:1.2em;}
+.ia-penser small {display:block;opacity:.7;margin:2px 0 7px;}
+.ia-penser .rail {width:min(380px,60vw);height:5px;border-radius:9px;background:rgba(124,58,237,.15);overflow:hidden;}
+.ia-penser .rail i {display:block;width:33%;height:100%;border-radius:9px;
+  background:linear-gradient(90deg,#22d3ee,#7c3aed,#f472b6);box-shadow:0 0 10px #7c3aed;animation:ia-rail 1.3s linear infinite;}
 
 /* ================= BARRE LATÉRALE « IA » ================= */
 @keyframes ia-tourne  {to{transform:rotate(360deg)}}
@@ -476,7 +488,7 @@ CSS_IA = """
 @media (prefers-reduced-motion: reduce){
   [data-testid="stSidebar"] *,[data-testid="stSidebar"] *::before,[data-testid="stSidebar"] *::after,
   .carte-ia *,.carte-ia::after,[data-testid="stSidebar"] > div:first-child{animation:none !important;}
-  .stApp h1,.badge-ia .point,[data-testid="stChatInput"],[data-testid="stSpinner"],[data-testid="stChatMessage"],
+  .stApp h1,.badge-ia .point,[data-testid="stChatInput"],[data-testid="stChatMessage"],.ia-penser *,.ia-penser *::before,.ia-penser *::after,
   .stApp[data-teststate="running"]::before{animation:none !important;}
 }
 </style>
@@ -552,8 +564,16 @@ NB_MAX_RESULTATS = 20      # maximum envoyé au modèle (prompt plus court = ré
 ECART_PERTINENCE = 0.08    # on écarte les extraits trop éloignés du meilleur score
 NB_ECHANGES_CONTEXTE = 4
 
-client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
-supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+try:  # délai maximal par appel Gemini : évite une attente de plusieurs minutes si le service ne répond plus
+    client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"], http_options=types.HttpOptions(timeout=120_000))
+except Exception:
+    client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
+try:  # idem pour Supabase : une recherche qui n'aboutit pas en 30 s affiche une erreur au lieu de rester bloquée
+    from supabase.lib.client_options import ClientOptions
+    supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"],
+                             options=ClientOptions(postgrest_client_timeout=30))
+except Exception:
+    supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 
 def _chemin_historique(username: str) -> str:
@@ -645,6 +665,11 @@ def reformuler_question(question: str, historique: list) -> str:
     """Rend la question autonome. Sautée quand ce n'est pas nécessaire (gain de 1 à 3 s)."""
     if not historique:
         return question
+    try:
+        if _fichiers_cibles(question):
+            return question  # la question nomme déjà un document : ne pas y mêler les sujets précédents
+    except Exception:
+        pass
     mots = question.split()
     debut = question.lower().lstrip().split(" ")[0]
     if len(mots) >= 8 and debut not in ("et", "pour", "aussi", "alors", "donc", "mais", "même"):
@@ -658,7 +683,9 @@ def reformuler_question(question: str, historique: list) -> str:
 
 Nouvelle question : "{question}"
 
-Reformule cette question en une question AUTONOME et COMPLÈTE (remplace "il", "ça", "et pour X"...).
+Reformule cette question en une question AUTONOME et COMPLÈTE (remplace "il", "ça", "et pour X"...) uniquement
+si elle dépend de la conversation. Si elle a déjà son propre sujet (titre de document, norme, thème nouveau),
+recopie-la TELLE QUELLE : n'y ajoute jamais un sujet de la conversation qu'elle ne mentionne pas.
 Réponds UNIQUEMENT par la question reformulée, sans guillemets ni commentaire."""
     try:
         resp = client.models.generate_content(
@@ -852,7 +879,7 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str, suivi=No
     return len(lignes)
 
 
-SEUIL_BASE_MO = 450            # au-delà, l'indexation s'arrête (limite gratuite Supabase : 500 Mo)
+SEUIL_BASE_MO = 430            # au-delà, l'indexation s'arrête (limite gratuite Supabase : 500 Mo)
 MAX_FICHIERS_PAR_PASSE = 5     # indexation automatique : au plus 5 PDF par passage (le CPU Streamlit Cloud est limité)
 MAX_FICHIERS_MANUEL = 8        # bouton « Synchroniser maintenant » : au plus 8 PDF par clic (secret MAX_FICHIERS_SYNCHRO pour changer)
 
@@ -1127,10 +1154,19 @@ def _vecteur_question(question: str):
 
 @st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
 def _candidats(question: str):
-    res = _rpc("match_documents", {
-        "query_embedding": _vecteur_question(question),
-        "match_count": NB_CANDIDATS,
-    })
+    try:
+        res = _rpc("match_documents", {
+            "query_embedding": _vecteur_question(question),
+            "match_count": NB_CANDIDATS,
+        })
+    except RuntimeError as e:
+        if "57014" not in str(e):
+            raise
+        time.sleep(2)  # délai Supabase dépassé : 2e essai plus léger (moins de candidats = recherche plus courte)
+        res = _rpc("match_documents", {
+            "query_embedding": _vecteur_question(question),
+            "match_count": max(10, NB_CANDIDATS // 3),
+        })
     if not res.data:
         # Une exception n'est PAS mise en cache par Streamlit (contrairement à une liste vide gardée 1 h)
         raise LookupError("La fonction match_documents n'a renvoyé aucun extrait : la table est vide, "
@@ -1163,7 +1199,8 @@ def _principales(question: str, generaux: list) -> list:
 # on retrouve le(s) PDF correspondant(s) par leur nom, et on prend leurs extraits les plus proches de la question.
 BONUS_CIBLE = 0.10
 MAX_FICHIERS_CIBLES = 4
-NB_EXTRAITS_CIBLES = 6
+NB_EXTRAITS_CIBLES = 8
+NB_CIBLES_GARANTIS = 10  # extraits du document cité toujours transmis au modèle
 
 
 def _nettoyer_ref(texte: str) -> str:
@@ -1181,43 +1218,120 @@ def _refs_dans_question(question: str) -> list:
     return refs
 
 
+MOTS_VIDES = {"de", "des", "du", "la", "le", "les", "un", "une", "et", "en", "pour", "sur", "au", "aux", "dans",
+              "par", "avec", "sans", "ou", "ce", "ces", "qui", "que", "quel", "quelle", "quels", "quelles", "est",
+              "sont", "pdf", "the", "of", "and"}
+
+
+def _mots_utiles(texte: str) -> set:
+    """Mots significatifs (sans accents, sans mots vides, pluriels simplifiés) : « chaussées » -> « chausse »."""
+    mots = set()
+    for m in _nettoyer_ref(texte).split():
+        if m in MOTS_VIDES or (len(m) <= 2 and not m.isdigit()):
+            continue
+        if len(m) > 3 and m.endswith(("s", "x")):
+            m = m[:-1]
+        mots.add(m)
+    return mots
+
+
 def _fichiers_cibles(question: str) -> list:
+    """PDF visés par la question : par numéro de norme (« 12350-2 ») ou par titre (« Catalogue des structures types »)."""
     existants = fichiers_pdf_existants()
-    refs = _refs_dans_question(question)
-    if not existants or not refs:
+    if not existants:
         return []
-    trouves = []
+    refs = _refs_dans_question(question)
+    mots_q = _mots_utiles(question)
+    notes = {}
     for chemin in sorted(existants):
-        nom = _nettoyer_ref(chemin.split("/")[-1].rsplit(".", 1)[0])
+        base = chemin.split("/")[-1].rsplit(".", 1)[0]
+        nom = _nettoyer_ref(base)
+        # 1) numéro de norme présent dans le nom du fichier
         for num, partie in refs:
             motif = f" {num} {partie} " if partie else f" {num} "
             if motif in nom:
-                trouves.append(chemin)
-                break
-    return trouves[:MAX_FICHIERS_CIBLES]
+                notes[chemin] = max(notes.get(chemin, 0), 2.0)
+        # 2) titre : presque tous les mots du nom du fichier figurent dans la question
+        mots_f = _mots_utiles(base)
+        if len(mots_f) >= 2 and mots_q:
+            couverture = len(mots_f & mots_q) / len(mots_f)
+            if couverture >= 0.8:
+                notes[chemin] = max(notes.get(chemin, 0), 1.0 + couverture)
+        # 3) la question reprend un morceau précis du nom (au moins 3 mots, tous présents dans le nom)
+        if len(mots_q) >= 3 and mots_q <= mots_f:
+            notes[chemin] = max(notes.get(chemin, 0), 1.5)
+    classes = sorted(notes, key=lambda c: (-notes[c], c))
+    return classes[:MAX_FICHIERS_CIBLES]
+
+
+def _diversifier(lignes: list, max_par_page: int = 2, n: int = NB_EXTRAITS_CIBLES) -> list:
+    """Évite que tous les extraits viennent de la même page (ex. page de garde en double)."""
+    comptes, sortie = {}, []
+    for l in lignes:
+        page = l["metadata"].get("page")
+        if comptes.get(page, 0) >= max_par_page:
+            continue
+        comptes[page] = comptes.get(page, 0) + 1
+        sortie.append(l)
+        if len(sortie) >= n:
+            break
+    return sortie
+
+
+def _apercu_document(chemin: str, table: str, n: int = 10) -> list:
+    """Vue d'ensemble d'un document : sommaire éventuel, début, puis extraits répartis sur toutes les pages."""
+    r = (supabase.table(table).select("id,content,metadata").eq("fichier", chemin)
+         .order("chunk_id").limit(2000).execute())
+    lignes = r.data or []
+    if not lignes:
+        return []
+    choisis = [l for l in lignes if "sommaire" in (l["content"] or "").lower()
+               or "table des mati" in (l["content"] or "").lower()][:2]
+    choisis += lignes[:2]
+    reste = max(1, n - len(choisis))
+    pas = max(1, len(lignes) // reste)
+    choisis += lignes[pas // 2::pas][:reste]
+    vus, sortie = set(), []
+    for l in choisis:
+        if l["id"] in vus:
+            continue
+        vus.add(l["id"])
+        l["similarity"] = 0.80
+        sortie.append(l)
+    return sortie[:n]
 
 
 def _candidats_cibles(question: str) -> list:
     fichiers = _fichiers_cibles(question)
+    st.session_state["diag_cibles"] = {}
     if not fichiers:
         return []
     table = st.secrets.get("SUPABASE_TABLE", "documents")
+    mots_q = _mots_utiles(question)
     sortie = []
     for chemin in fichiers:
         lignes = []
-        try:  # 1) extraits du fichier les plus proches de la question
-            res = _rpc("match_documents_prefixe", {
-                "query_embedding": _vecteur_question(question),
-                "match_count": NB_EXTRAITS_CIBLES,
-                "motif": chemin,
-            })
-            lignes = res.data or []
-        except Exception:
-            lignes = []
+        # La question ne fait que nommer le document -> on en donne un aperçu (objet, plan, contenu)
+        titre_seul = len(mots_q) >= 2 and mots_q <= _mots_utiles(chemin.split("/")[-1].rsplit(".", 1)[0])
+        if titre_seul:
+            try:
+                lignes = _apercu_document(chemin, table)
+            except Exception:
+                lignes = []
         if not lignes:
-            try:  # 2) repli : premières pages du fichier (portée, définitions)
-                r = (supabase.table(table).select("content,metadata")
-                     .eq("metadata->>chemin", chemin).limit(40).execute())
+            try:  # extraits du fichier les plus proches de la question
+                res = _rpc("match_documents_prefixe", {
+                    "query_embedding": _vecteur_question(question),
+                    "match_count": NB_EXTRAITS_CIBLES * 2,
+                    "motif": chemin,
+                })
+                lignes = _diversifier(res.data or [])
+            except Exception:
+                lignes = []
+        if not lignes:
+            try:  # repli : premières pages du fichier (portée, définitions)
+                r = (supabase.table(table).select("id,content,metadata")
+                     .eq("fichier", chemin).limit(40).execute())  # colonne « fichier » = chemin complet, déjà indexée
                 lignes = sorted(r.data or [], key=lambda l: (l["metadata"].get("page") or 0))[:NB_EXTRAITS_CIBLES]
                 for l in lignes:
                     l["similarity"] = 0.80
@@ -1225,8 +1339,42 @@ def _candidats_cibles(question: str) -> list:
                 lignes = []
         for l in lignes:
             l["cible"] = True
+        st.session_state["diag_cibles"][chemin.split("/")[-1]] = len(lignes)
         sortie += lignes
     return sortie
+
+
+# --- Recherche par mots-clés (complète la recherche vectorielle) ---
+# Les codes et sigles (TPL6, GNF1, GB3, BBSG, C25/30...) et les titres de documents sont mal captés par les
+# vecteurs. La recherche plein texte de Postgres (fonction SQL recherche_texte) les retrouve exactement.
+NB_LEXICAUX = 8
+MOTS_GENERIQUES = {"quelle", "quel", "quels", "quelles", "comment", "donne", "donnez", "selon", "dans", "avec",
+                   "tout", "tous", "plus", "cette", "cet", "ces", "sont", "etre", "avoir", "faire", "norme",
+                   "normes", "exigence", "exigences", "pour", "quoi", "pourquoi", "est", "les", "des", "une"}
+
+
+def _termes_lexicaux(question: str) -> str:
+    """Termes distinctifs de la question, au format « a | b | c » (uniquement a-z et 0-9, donc sans risque)."""
+    mots, vus = [], set()
+    for m in re.findall(r"[a-z0-9]+", _sans_accents(question)):
+        if len(m) < 3 or m in MOTS_VIDES or m in MOTS_GENERIQUES or m in vus:
+            continue
+        vus.add(m)
+        mots.append(m)
+    # les termes contenant un chiffre (codes) d'abord, puis les plus longs
+    mots.sort(key=lambda m: (not any(ch.isdigit() for ch in m), -len(m)))
+    return " | ".join(mots[:10])
+
+
+def _candidats_lexicaux(question: str) -> list:
+    termes = _termes_lexicaux(question)
+    if not termes:
+        return []
+    try:
+        res = _rpc("recherche_texte", {"termes": termes, "match_count": 12}, essais=1)
+        return res.data or []
+    except Exception:
+        return []  # fonction SQL pas encore créée ou indisponible : on continue avec la seule recherche vectorielle
 
 
 def rechercher_chunks(question: str, seulement_principales: bool = False):
@@ -1246,6 +1394,23 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
 
     candidats = _candidats_cibles(question) + candidats  # norme citée par son numéro : toujours dans la course
 
+    # Recherche par mots-clés : fusionnée avec les résultats vectoriels
+    lexicaux = _candidats_lexicaux(question)
+    if lexicaux:
+        par_id = {c.get("id"): c for c in candidats if c.get("id") is not None}
+        base = max((c["similarity"] for c in candidats), default=0.8)
+        ajoutes = 0
+        for c in lexicaux:
+            if c.get("id") in par_id:
+                par_id[c["id"]]["similarity"] += 0.03   # trouvé par les deux méthodes : confiance accrue
+                continue
+            if ajoutes >= NB_LEXICAUX or (seulement_principales and not est_principale(c)):
+                continue
+            c["similarity"] = base - 0.02 - 0.004 * ajoutes
+            c["lexical"] = True
+            candidats.append(c)
+            ajoutes += 1
+
     existants = fichiers_pdf_existants()
     if existants and layout_coherent():
         candidats = [c for c in candidats if not _chemin_norm(c) or _chemin_norm(c) in existants]
@@ -1260,6 +1425,13 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
 
     meilleur = candidats[0]["score"]
     gardes, vus = [], set()
+    # Extraits du document cité par l'agent : gardés d'office, même si leur similarité est faible
+    # (PDF scanné, tableaux, titre peu présent dans le texte...)
+    for c in [c for c in candidats if c.get("cible")][:NB_CIBLES_GARANTIS]:
+        cle = (c["metadata"].get("fichier"), c["metadata"].get("page"), c["content"][:120])
+        if cle not in vus:
+            vus.add(cle)
+            gardes.append(c)
     for c in candidats:
         cle = (c["metadata"].get("fichier"), c["metadata"].get("page"), c["content"][:120])
         if cle in vus:
@@ -1277,13 +1449,14 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
 
 def construire_prompt(question: str, chunks: list, historique: list) -> str:
     contexte_docs = "\n\n---\n\n".join(
-        f"[Source {i+1} — {'NORME DEMANDÉE' if c.get('cible') else 'NORME PRINCIPALE' if c.get('principale') else 'document complémentaire'} — "
+        f"[Source {i+1} — {'DOCUMENT DEMANDÉ' if c.get('cible') else 'NORME PRINCIPALE' if c.get('principale') else 'document complémentaire'} — "
         f"{c['metadata'].get('fichier')}, page {c['metadata'].get('page')}]\n{c['content']}"
         for i, c in enumerate(chunks)
     )
     derniers = historique[-NB_ECHANGES_CONTEXTE:]
     fil = "\n".join(f"{'Agent' if h['role'] == 'user' else 'Assistant'} : {h['content'][:600]}" for h in derniers)
-    bloc_historique = f"\nContexte de la conversation :\n{fil}\n" if derniers else ""
+    bloc_historique = (f"\nContexte de la conversation (sert uniquement à comprendre les renvois comme « et pour... » ; "
+                       f"n'en reprends pas les sujets si la question est autonome) :\n{fil}\n") if derniers else ""
 
     return f"""Tu es un assistant technique pour les agents du LPEE (laboratoire d'essais de matériaux et travaux publics).
 
@@ -1295,12 +1468,15 @@ RÈGLES DE PRÉCISION (impératives) :
    Ne les arrondis pas, ne les convertis pas.
 4. Si des extraits se contredisent (versions/normes différentes), signale-le et cite chaque source.
 5. Cite chaque affirmation avec (Source X) — fichier et page.
-6. Les extraits « NORME DEMANDÉE » proviennent de la norme que l'agent cite par son numéro : traite-les en priorité.
+6. Les extraits « DOCUMENT DEMANDÉ » proviennent du document que l'agent cite par son numéro ou son titre : traite-les en priorité.
    PRIORITÉ AUX NORMES PRINCIPALES : les extraits « NORME PRINCIPALE » font référence. Appuie-toi d'abord sur eux.
    N'utilise un « document complémentaire » que pour compléter, et précise-le (« d'après un document complémentaire »).
    En cas de divergence, la norme principale prévaut ; signale l'écart. Si aucun extrait de norme principale
    ne traite la question, dis-le dans ta première phrase.
-7. Termine par une section « Points non couverts » listant ce que les extraits ne permettent pas de confirmer.
+7. Si la question se limite au nom ou au numéro d'un document, présente ce document d'après les extraits
+   « DOCUMENT DEMANDÉ » : émetteur, édition ou date, objet, domaine d'application, plan et contenu (chapitres,
+   tableaux, catégories). N'ajoute aucun sujet des échanges précédents que la question ne mentionne pas.
+8. Termine par une section « Points non couverts » listant ce que les extraits ne permettent pas de confirmer.
    Ne devine jamais.
 
 FORMAT : commence directement par la réponse (pas d'introduction), puis sections courtes avec puces ;
@@ -1360,9 +1536,80 @@ def telecharger_pdf(chemin_relatif: str) -> bytes:
         return f.read()
 
 
+# --- Visionneuse PDF intégrée (page affichée en image, avec passage cité surligné) ---
+@st.cache_data(show_spinner="Affichage de la page...", max_entries=60)
+def rendre_page_pdf(chemin: str, page: int, zoom: float, surligner: str = "") -> tuple:
+    """Retourne (image PNG de la page, nombre de pages). Surligne le passage cité si le PDF a une couche texte."""
+    import fitz  # PyMuPDF
+    with fitz.open(stream=telecharger_pdf(chemin), filetype="pdf") as doc:
+        nb = len(doc)
+        p = doc[max(1, min(nb, int(page))) - 1]
+        if surligner:
+            try:
+                mots = surligner.split()
+                for debut in (0, 6, 12):
+                    morceau = " ".join(mots[debut:debut + 6])
+                    if len(mots[debut:debut + 6]) >= 3:
+                        for rect in p.search_for(morceau):
+                            p.add_highlight_annot(rect)
+            except Exception:
+                pass  # PDF scanné (pas de texte) ou passage non retrouvé : on affiche simplement la page
+        pix = p.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("png"), nb
+
+
+def _aller_page(cle: str, delta: int):
+    st.session_state[f"visu_page_{cle}"] = max(1, int(st.session_state.get(f"visu_page_{cle}", 1)) + delta)
+
+
+def _entier(valeur, defaut: int = 1) -> int:
+    try:
+        return max(1, int(valeur))
+    except (TypeError, ValueError):
+        return defaut
+
+
+@st.dialog("👁️ Visualisation du document", width="large")
+def fenetre_visionneuse(chemin: str, nom: str, page_extrait: int, extrait: str, cle: str):
+    """Fenêtre pop-up : page du PDF en image, navigation, passage cité surligné, téléchargement."""
+    st.markdown(f"**📄 {nom}**")
+    page = _entier(st.session_state.get(f"visu_page_{cle}", page_extrait))
+    hd = bool(st.session_state.get(f"visu_hd_{cle}", False))
+    try:
+        surligner = extrait if page == page_extrait else ""
+        png, nb = rendre_page_pdf(chemin, page, 2.6 if hd else 1.8, surligner)
+    except Exception as e:
+        st.error(f"Impossible d'afficher ce PDF : {e}")
+        return
+    st.session_state[f"visu_page_{cle}"] = max(1, min(nb, page))  # reste dans les limites du document
+    c_prec, c_num, c_suiv, c_hd, c_dl = st.columns([1.3, 1.1, 1.3, 1.6, 1.6])
+    c_prec.button("◀ Précédente", key=f"visu_prec_{cle}", on_click=_aller_page, args=(cle, -1),
+                  disabled=page <= 1, use_container_width=True)
+    c_num.number_input("Page", min_value=1, max_value=nb, step=1, key=f"visu_page_{cle}",
+                       label_visibility="collapsed")
+    c_suiv.button("Suivante ▶", key=f"visu_suiv_{cle}", on_click=_aller_page, args=(cle, 1),
+                  disabled=page >= nb, use_container_width=True)
+    c_hd.checkbox("Haute définition", key=f"visu_hd_{cle}")
+    try:
+        c_dl.download_button("⬇️ Télécharger", data=telecharger_pdf(chemin), file_name=nom,
+                             mime="application/pdf", key=f"visu_dl_{cle}", use_container_width=True)
+    except Exception:
+        pass
+    st.caption(f"Page {max(1, min(nb, page))} / {nb}"
+               + (" · passage cité surligné" if page == page_extrait and extrait else ""))
+    st.image(png, use_container_width=True)
+
+
+def ouvrir_visionneuse(cle: str, chemin: str, nom: str, page, extrait: str = ""):
+    page = _entier(page)
+    st.session_state[f"visu_page_{cle}"] = page
+    fenetre_visionneuse(chemin, nom or chemin.split("/")[-1], page, " ".join((extrait or "").split())[:300], cle)
+
+
 def afficher_sources(chunks: list, prefixe_cle: str):
     existants = fichiers_pdf_existants()
     verif = bool(existants) and layout_coherent()
+    peut_visualiser = bool(HF_REPO_ID and HF_TOKEN)
 
     def _supprime(c) -> bool:
         return verif and bool(_chemin_norm(c)) and _chemin_norm(c) not in existants
@@ -1376,12 +1623,15 @@ def afficher_sources(chunks: list, prefixe_cle: str):
             etiquette = "⭐ Norme principale" if c.get("principale") else "Complémentaire"
             st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} · {etiquette} (pertinence : {c['similarity']:.0%})")
             st.caption(c["content"])
+            if peut_visualiser and meta.get("chemin"):
+                if st.button("👁️ Visualiser cette source", key=f"vis_src_{prefixe_cle}_{i}"):
+                    ouvrir_visionneuse(prefixe_cle, meta["chemin"], meta.get("fichier"), meta.get("page"), c["content"])
             st.divider()
 
     if nb_retirees:
         st.caption(f"ℹ️ {nb_retirees} extrait(s) cité(s) proviennent de documents retirés de la base : masqués.")
 
-    if not (HF_REPO_ID and HF_TOKEN):
+    if not peut_visualiser:
         return
 
     fichiers_uniques = {}
@@ -1393,10 +1643,16 @@ def afficher_sources(chunks: list, prefixe_cle: str):
             fichiers_uniques[meta["chemin"]] = meta.get("fichier")
 
     if fichiers_uniques:
-        st.markdown("**📥 Télécharger les documents sources**")
+        st.markdown("**📥 Documents sources : visualiser ou télécharger**")
         for i, (chemin, nom) in enumerate(fichiers_uniques.items()):
             cle = f"{prefixe_cle}_{i}"
-            if st.button(f"📄 {nom}", key=f"prep_{cle}"):
+            c_nom, c_vis, c_dl = st.columns([5, 2, 2], vertical_alignment="center")
+            c_nom.markdown(f"📄 {nom}")
+            visualiser = c_vis.button("👁️ Visualiser", key=f"vis_dl_{cle}", use_container_width=True)
+            preparer = c_dl.button("⬇️ Télécharger", key=f"prep_{cle}", use_container_width=True)
+            if visualiser:
+                ouvrir_visionneuse(prefixe_cle, chemin, nom, 1, "")
+            if preparer:
                 try:
                     st.download_button(
                         f"⬇️ Enregistrer {nom}",
@@ -1423,7 +1679,9 @@ if st.session_state.get("historique_charge_pour") != st.session_state.username_c
 historique = st.session_state.sessions[st.session_state.session_courante]
 
 # --- Barre latérale (Sidebar) ---
+VERSION_APP = "v2026.10.14-visionneuse"
 with st.sidebar:
+    st.caption(f"Version : {VERSION_APP}")
     if os.path.exists("logo lpee.jpg"):
         st.image("logo lpee.jpg", use_container_width=True)
     elif os.path.exists("logo_lpee.jpg"):
@@ -1763,6 +2021,28 @@ if st.session_state.get("erreur_historique"):
 lancer_synchro_auto()
 
 
+def indicateur_ia(zone, titre: str, detail: str):
+    """Affiche un indicateur animé bien visible (ou un simple message si les effets sont désactivés)."""
+    if EFFETS_IA:
+        zone.markdown(
+            f'''<div class="ia-penser"><span class="orbe"></span><div><div class="titre">{titre}</div>
+<small>{detail}</small><div class="rail"><i></i></div></div></div>''', unsafe_allow_html=True)
+    else:
+        zone.caption(f"⏳ {titre} — {detail}")
+
+
+def flux_avec_indicateur(flux, zone):
+    """Fait disparaître l'indicateur dès que le premier mot de la réponse arrive."""
+    attente = True
+    for morceau in flux:
+        if attente:
+            zone.empty()
+            attente = False
+        yield morceau
+    if attente:
+        zone.empty()
+
+
 # --- Interface Principale ---
 if EFFETS_IA:
     if st.session_state.pop("anim_ia", False):
@@ -1809,10 +2089,17 @@ if question:
     with st.chat_message("assistant"):
         t0 = time.time()
         try:
-            with st.spinner("🧠 L'IA analyse les documents indexés..."):
-                question_recherche = reformuler_question(question, historique[:-1])
-                chunks = rechercher_chunks(question_recherche, seulement_principales)
+            zone_ia = st.empty()
+            indicateur_ia(zone_ia, "L'IA analyse les documents", "Recherche vectorielle dans les normes indexées")
+            question_recherche = reformuler_question(question, historique[:-1])
+            chunks = rechercher_chunks(question_recherche, seulement_principales)
+            for _nom, _n in (st.session_state.pop("diag_cibles", None) or {}).items():
+                if _n:
+                    st.caption(f"🎯 Document détecté d'après votre question : {_nom} — {_n} extrait(s) retrouvé(s)")
+                else:
+                    st.caption(f"⚠️ Document détecté ({_nom}) mais aucun extrait lisible en base : PDF scanné ou indexation incomplète ?")
         except Exception as e:
+            zone_ia.empty()
             historique.pop()  # la question n'a pas reçu de réponse : on ne la garde pas dans l'historique
             detail = str(e)
             st.error("⚠️ La recherche dans la base a échoué. Réessayez dans un instant.")
@@ -1830,6 +2117,7 @@ if question:
         t_recherche = time.time() - t0
 
         if not chunks:
+            zone_ia.empty()
             reponse = (
                 "Aucun passage trouvé dans les **normes principales** pour cette question. "
                 "Décochez « Chercher uniquement dans les normes principales » pour élargir la recherche."
@@ -1842,7 +2130,8 @@ if question:
         else:
             prompt = construire_prompt(question, chunks, historique[:-1])
             t1 = time.time()
-            reponse = st.write_stream(flux_reponse(prompt))  # affichage progressif
+            indicateur_ia(zone_ia, "L'IA rédige la réponse", f"{len(chunks)} extraits sélectionnés · analyse en cours")
+            reponse = st.write_stream(flux_avec_indicateur(flux_reponse(prompt), zone_ia))  # affichage progressif
             t_generation = time.time() - t1
             afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
             st.caption(f"⏱️ Recherche : {t_recherche:.1f} s · Génération de la réponse : {t_generation:.1f} s")

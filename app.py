@@ -1424,12 +1424,119 @@ def _candidats_lexicaux(question: str) -> list:
         return []  # fonction SQL pas encore créée ou indisponible : on continue avec la seule recherche vectorielle
 
 
+# --- Recherche multi-requêtes + reclassement par l'IA (pertinence : sources compatibles avec la question) ---
+NB_VARIANTES = 2          # reformulations techniques de la question
+RECLASSEMENT_IA = str(st.secrets.get("RECLASSEMENT_IA", "true")).strip().lower() != "false"  # secret = "false" : désactive
+TAILLE_POOL_RECLASSEMENT = 30
+NB_MAX_RECLASSES = 14     # extraits transmis au modèle après reclassement
+
+
+@st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
+def etendre_requete(question: str) -> tuple:
+    """Reformulations avec le vocabulaire des normes (« acceptation » -> « critères de conformité »...).
+    Lève une exception en cas d'échec (donc rien n'est mis en cache)."""
+    if not RECLASSEMENT_IA or len(question.split()) > 25:
+        return ()
+    prompt = (
+        "Tu aides à chercher dans des normes de génie civil et de matériaux (béton, granulats, chaussées, sols, "
+        "ciments, aciers, adjuvants), en français.\n"
+        f"Question de l'agent : \"{question}\"\n\n"
+        f"Écris {NB_VARIANTES} requêtes de recherche DIFFÉRENTES qui reprennent cette question avec le vocabulaire "
+        "technique employé dans les normes (ex. « acceptation » -> « critères de conformité », « critères "
+        "d'identification », « essais de contrôle » ; « résistance » -> « résistance à la compression fck fcm »). "
+        "Chaque requête : 6 à 14 mots, une par ligne, sans numéro, sans commentaire."
+    )
+    resp = client.models.generate_content(
+        model=MODELE_REFORMULATION, contents=prompt, config=_config(120, MODELE_REFORMULATION, 0.2))
+    variantes = []
+    for ligne in (resp.text or "").splitlines():
+        ligne = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", ligne).strip().strip('"«» ')
+        if len(ligne.split()) >= 3 and ligne.lower() != question.lower():
+            variantes.append(ligne)
+    return tuple(variantes[:NB_VARIANTES])
+
+
+def _fusionner(listes: list) -> list:
+    """Fusionne des listes d'extraits (doublons regroupés). Un extrait trouvé par plusieurs requêtes gagne en rang."""
+    par_cle = {}
+    for liste in listes:
+        for c in liste:
+            m = c["metadata"]
+            cle = c.get("id") if c.get("id") is not None else (m.get("fichier"), m.get("page"), c["content"][:120])
+            if cle in par_cle:
+                ex = par_cle[cle]
+                ex["similarity"] = max(ex["similarity"], c["similarity"])
+                ex["_n"] += 1
+            else:
+                c["_n"] = 1
+                par_cle[cle] = c
+    for c in par_cle.values():
+        c["similarity"] += 0.015 * (c["_n"] - 1)
+    return sorted(par_cle.values(), key=lambda c: c["similarity"], reverse=True)
+
+
+def reclasser_llm(question: str, pool: list):
+    """Gemini Flash-Lite note chaque extrait (2 = répond directement, 1 = utile, 0 = hors sujet).
+    Retourne (extraits retenus triés par pertinence, True) ou (pool, False) si le reclassement échoue."""
+    if not RECLASSEMENT_IA or len(pool) < 6:
+        return pool, False
+    lignes = []
+    for i, c in enumerate(pool, 1):
+        m = c["metadata"]
+        extrait = " ".join(nettoyer_remplissage(c["content"]).split())[:380]
+        lignes.append(f"[{i}] ({m.get('fichier')}, p.{m.get('page')}) {extrait}")
+    prompt = (
+        f"Question d'un agent de laboratoire : \"{question}\"\n\n"
+        "Voici des extraits de normes, numérotés. Note chacun selon son utilité pour répondre à CETTE question :\n"
+        "2 = contient directement la règle, le critère, la valeur ou la définition demandée ;\n"
+        "1 = utile en complément (même sujet, contexte, définition liée) ;\n"
+        "0 = hors sujet (autre produit, autre essai, autre notion).\n"
+        "Réponds UNIQUEMENT par un objet JSON de la forme {\"1\": 2, \"2\": 0, ...} couvrant tous les extraits.\n\n"
+        "EXTRAITS :\n" + "\n".join(lignes)
+    )
+    try:
+        resp = client.models.generate_content(
+            model=MODELE_REFORMULATION, contents=prompt, config=_config(700, MODELE_REFORMULATION, 0.0))
+        notes = {int(k): int(v) for k, v in re.findall(r'"?(\d+)"?\s*:\s*([012])', resp.text or "")}
+    except Exception:
+        return pool, False
+    if len(notes) < 0.6 * len(pool):
+        return pool, False  # réponse inexploitable : on garde le classement vectoriel
+    for i, c in enumerate(pool, 1):
+        c["note"] = 2 if c.get("cible") else notes.get(i, 1)
+    tries = sorted(pool, key=lambda c: (-c["note"], -c["score"]))
+    retenus = [c for c in tries if c["note"] >= 1]
+    if len(retenus) < 6:
+        retenus += [c for c in tries if c["note"] < 1][:6 - len(retenus)]
+    return retenus[:NB_MAX_RECLASSES], True
+
+
 def rechercher_chunks(question: str, seulement_principales: bool = False):
     """Recherche vectorielle en deux niveaux : les normes principales sont cherchées à part (et favorisées),
     puis complétées par le reste de la base (sauf en mode « normes principales uniquement »).
     Écarte aussi les normes supprimées de Hugging Face."""
     generaux = _candidats(question)
+    try:
+        variantes = etendre_requete(question)
+    except Exception:
+        variantes = ()
+    if variantes:
+        listes = [generaux]
+        for v in variantes:
+            try:
+                listes.append(_candidats(v))
+            except Exception:
+                pass
+        generaux = _fusionner(listes)[:60]
     principaux = _principales(question, generaux)
+    if variantes:
+        listes = [principaux]
+        for v in variantes:
+            try:
+                listes.append(_principales(v, generaux))
+            except Exception:
+                pass
+        principaux = _fusionner(listes)[:NB_CANDIDATS_PRINCIPALES + 10]
 
     if seulement_principales:
         candidats = list(principaux)
@@ -1470,6 +1577,12 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
                       + (BONUS_CIBLE if c.get("cible") else 0.0))
     candidats.sort(key=lambda c: c["score"], reverse=True)
 
+    # Reclassement par l'IA : écarte les extraits hors sujet (sources compatibles avec la question)
+    reste = candidats[TAILLE_POOL_RECLASSEMENT:]
+    candidats, reclasse = reclasser_llm(question, candidats[:TAILLE_POOL_RECLASSEMENT])
+    if not reclasse:
+        candidats = sorted(candidats + reste, key=lambda c: c["score"], reverse=True)
+
     meilleur = candidats[0]["score"]
     gardes, vus = [], set()
     # Extraits du document cité par l'agent : gardés d'office, même si leur similarité est faible
@@ -1484,13 +1597,14 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
         if cle in vus:
             continue  # doublon
         vus.add(cle)
-        if len(gardes) < NB_MIN_RESULTATS or c["score"] >= meilleur - ECART_PERTINENCE:
+        if reclasse or len(gardes) < NB_MIN_RESULTATS or c["score"] >= meilleur - ECART_PERTINENCE:
             gardes.append(c)
         if len(gardes) >= NB_MAX_RESULTATS:
             break
 
     # Normes principales en premier, puis regroupement par document et page
-    gardes.sort(key=lambda c: (not c.get("cible"), not c["principale"], str(c["metadata"].get("fichier")), c["metadata"].get("page") or 0))
+    gardes.sort(key=lambda c: (not c.get("cible"), -c.get("note", 1), not c["principale"],
+                               str(c["metadata"].get("fichier")), c["metadata"].get("page") or 0))
     return gardes
 
 
@@ -1509,7 +1623,12 @@ def construire_prompt(question: str, chunks: list, historique: list) -> str:
 
 RÈGLES DE PRÉCISION (impératives) :
 1. Réponds UNIQUEMENT à partir des extraits ci-dessous. N'utilise aucune connaissance extérieure.
-2. Sois EXHAUSTIF : croise tous les extraits pertinents et fusionne ceux qui se complètent.
+2. RESTE DANS LE SUJET : réponds précisément à la question posée. Utilise seulement les extraits qui la traitent
+   directement ou la complètent utilement ; ignore les autres, même s'ils figurent ci-dessous (ne les résume pas,
+   ne les cite pas). Sois COMPLET sur le sujet : pour chaque critère, donne la règle entière (valeurs, seuils,
+   formules, conditions d'application, article ou tableau de la norme) et recopie les tableaux pertinents ; ne te
+   contente pas de renvoyer à un paragraphe quand son contenu figure dans les extraits. Fusionne les extraits
+   qui se complètent.
 3. Reprends FIDÈLEMENT les valeurs chiffrées, unités, seuils, tolérances, formules, références de normes
    (ex. NF EN, NM, ASTM), numéros d'articles/paragraphes et conditions d'essai, exactement comme écrits.
    Ne les arrondis pas, ne les convertis pas.
@@ -1523,11 +1642,14 @@ RÈGLES DE PRÉCISION (impératives) :
 7. Si la question se limite au nom ou au numéro d'un document, présente ce document d'après les extraits
    « DOCUMENT DEMANDÉ » : émetteur, édition ou date, objet, domaine d'application, plan et contenu (chapitres,
    tableaux, catégories). N'ajoute aucun sujet des échanges précédents que la question ne mentionne pas.
-8. Termine par une section « Points non couverts » listant ce que les extraits ne permettent pas de confirmer.
-   Ne devine jamais.
+8. Si la question est large ou ambiguë (ex. « critère d'acceptation »), indique en une phrase l'interprétation
+   retenue (ex. critères de conformité, critères d'identification...), traite-la en détail, puis propose en
+   dernière ligne 1 ou 2 précisions possibles.
+9. Termine par « Points non couverts » : 3 puces au maximum, uniquement ce qui manque pour répondre à CETTE
+   question (pas la liste des sujets voisins). Si rien d'important ne manque, omets cette section. Ne devine jamais.
 
-FORMAT : commence directement par la réponse (pas d'introduction), puis sections courtes avec puces ;
-tableau si tu compares des valeurs ; en dernier, « Points non couverts ».
+FORMAT : commence directement par la réponse (pas d'introduction) ; la réponse à la question d'abord, puis les
+détails par puces ; tableau pour les valeurs ; en dernier, « Points non couverts » s'il y a lieu.
 {bloc_historique}
 EXTRAITS :
 {contexte_docs}

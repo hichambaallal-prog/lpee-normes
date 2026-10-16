@@ -1497,7 +1497,7 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
 def construire_prompt(question: str, chunks: list, historique: list) -> str:
     contexte_docs = "\n\n---\n\n".join(
         f"[Source {i+1} — {'DOCUMENT DEMANDÉ' if c.get('cible') else 'NORME PRINCIPALE' if c.get('principale') else 'document complémentaire'} — "
-        f"{c['metadata'].get('fichier')}, page {c['metadata'].get('page')}]\n{nettoyer_remplissage(c['content'])}"
+        f"{c['metadata'].get('fichier')}, page {c['metadata'].get('page')}]\n{c['content']}"
         for i, c in enumerate(chunks)
     )
     derniers = historique[-NB_ECHANGES_CONTEXTE:]
@@ -1669,7 +1669,7 @@ def afficher_sources(chunks: list, prefixe_cle: str):
             meta = c["metadata"]
             etiquette = "⭐ Norme principale" if c.get("principale") else "Complémentaire"
             st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} · {etiquette} (pertinence : {c['similarity']:.0%})")
-            st.caption(nettoyer_remplissage(c["content"]))
+            st.caption(c["content"])
             if peut_visualiser and meta.get("chemin"):
                 if st.button("👁️ Visualiser cette source", key=f"vis_src_{prefixe_cle}_{i}"):
                     ouvrir_visionneuse(prefixe_cle, meta["chemin"], meta.get("fichier"), meta.get("page"), c["content"])
@@ -2178,7 +2178,7 @@ if question:
             prompt = construire_prompt(question, chunks, historique[:-1])
             t1 = time.time()
             indicateur_ia(zone_ia, "L'IA rédige la réponse", f"{len(chunks)} extraits sélectionnés · analyse en cours")
-            reponse = st.write_stream(flux_avec_indicateur(filtrer_remplissage_flux(flux_reponse(prompt)), zone_ia))  # affichage progressif
+            reponse = st.write_stream(flux_avec_indicateur(flux_reponse(prompt), zone_ia))  # affichage progressif
             t_generation = time.time() - t1
             afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
             st.caption(f"⏱️ Recherche : {t_recherche:.1f} s · Génération de la réponse : {t_generation:.1f} s")

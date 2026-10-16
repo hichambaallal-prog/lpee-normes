@@ -1433,17 +1433,18 @@ NB_MAX_RECLASSES = 14     # extraits transmis au modèle après reclassement
 
 @st.cache_data(ttl=3600, max_entries=300, show_spinner=False)
 def etendre_requete(question: str) -> tuple:
-    """Reformulations avec le vocabulaire des normes (« acceptation » -> « critères de conformité »...).
+    """Reformulations de la question avec le vocabulaire des normes (synonymes, termes normatifs).
     Lève une exception en cas d'échec (donc rien n'est mis en cache)."""
     if not RECLASSEMENT_IA or len(question.split()) > 25:
         return ()
     prompt = (
-        "Tu aides à chercher dans des normes de génie civil et de matériaux (béton, granulats, chaussées, sols, "
-        "ciments, aciers, adjuvants), en français.\n"
+        "Tu aides à chercher dans une base de normes et de documents techniques de génie civil, de géotechnique, "
+        "de routes et de matériaux de construction, en français.\n"
         f"Question de l'agent : \"{question}\"\n\n"
-        f"Écris {NB_VARIANTES} requêtes de recherche DIFFÉRENTES qui reprennent cette question avec le vocabulaire "
-        "technique employé dans les normes (ex. « acceptation » -> « critères de conformité », « critères "
-        "d'identification », « essais de contrôle » ; « résistance » -> « résistance à la compression fck fcm »). "
+        f"Écris {NB_VARIANTES} requêtes de recherche DIFFÉRENTES qui reprennent le même besoin avec le vocabulaire "
+        "employé dans les normes : termes normatifs et synonymes (exigences, spécifications, conformité, méthode "
+        "d'essai, mode opératoire, seuil, tolérance, domaine d'application, définition...), sigles, grandeurs et "
+        "unités concernés. Reste fidèle au sujet de la question : n'ajoute aucun autre sujet. "
         "Chaque requête : 6 à 14 mots, une par ligne, sans numéro, sans commentaire."
     )
     resp = client.models.generate_content(
@@ -1517,7 +1518,7 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
     Écarte aussi les normes supprimées de Hugging Face."""
     generaux = _candidats(question)
     try:
-        variantes = etendre_requete(question)
+        variantes = () if _fichiers_cibles(question) else etendre_requete(question)  # document nommé : inutile
     except Exception:
         variantes = ()
     if variantes:
@@ -1623,12 +1624,13 @@ def construire_prompt(question: str, chunks: list, historique: list) -> str:
 
 RÈGLES DE PRÉCISION (impératives) :
 1. Réponds UNIQUEMENT à partir des extraits ci-dessous. N'utilise aucune connaissance extérieure.
-2. RESTE DANS LE SUJET : réponds précisément à la question posée. Utilise seulement les extraits qui la traitent
-   directement ou la complètent utilement ; ignore les autres, même s'ils figurent ci-dessous (ne les résume pas,
-   ne les cite pas). Sois COMPLET sur le sujet : pour chaque critère, donne la règle entière (valeurs, seuils,
-   formules, conditions d'application, article ou tableau de la norme) et recopie les tableaux pertinents ; ne te
-   contente pas de renvoyer à un paragraphe quand son contenu figure dans les extraits. Fusionne les extraits
-   qui se complètent.
+2. RESTE DANS LE SUJET : réponds précisément à la question posée, quel que soit le domaine. Utilise seulement
+   les extraits qui la traitent directement ou la complètent utilement ; ignore les autres, même s'ils figurent
+   ci-dessous (ne les résume pas, ne les cite pas). Sois COMPLET sur le sujet : donne la règle ou la méthode
+   entière (valeurs, seuils, formules, étapes, conditions d'application, article ou tableau de la norme) et
+   recopie les tableaux pertinents ; ne te contente pas de renvoyer à un paragraphe quand son contenu figure dans
+   les extraits. Fusionne les extraits qui se complètent. Si la question demande explicitement une vue d'ensemble
+   (présenter, résumer, lister toutes les exigences), élargis en conséquence.
 3. Reprends FIDÈLEMENT les valeurs chiffrées, unités, seuils, tolérances, formules, références de normes
    (ex. NF EN, NM, ASTM), numéros d'articles/paragraphes et conditions d'essai, exactement comme écrits.
    Ne les arrondis pas, ne les convertis pas.
@@ -1642,9 +1644,9 @@ RÈGLES DE PRÉCISION (impératives) :
 7. Si la question se limite au nom ou au numéro d'un document, présente ce document d'après les extraits
    « DOCUMENT DEMANDÉ » : émetteur, édition ou date, objet, domaine d'application, plan et contenu (chapitres,
    tableaux, catégories). N'ajoute aucun sujet des échanges précédents que la question ne mentionne pas.
-8. Si la question est large ou ambiguë (ex. « critère d'acceptation »), indique en une phrase l'interprétation
-   retenue (ex. critères de conformité, critères d'identification...), traite-la en détail, puis propose en
-   dernière ligne 1 ou 2 précisions possibles.
+8. Si la question est large ou ambiguë (plusieurs sens possibles, plusieurs normes ou produits concernés),
+   indique en une phrase l'interprétation retenue, traite-la en détail, puis propose en dernière ligne 1 ou 2
+   précisions possibles.
 9. Termine par « Points non couverts » : 3 puces au maximum, uniquement ce qui manque pour répondre à CETTE
    question (pas la liste des sujets voisins). Si rien d'important ne manque, omets cette section. Ne devine jamais.
 

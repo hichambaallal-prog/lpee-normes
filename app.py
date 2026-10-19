@@ -1424,6 +1424,114 @@ def _candidats_lexicaux(question: str) -> list:
         return []  # fonction SQL pas encore créée ou indisponible : on continue avec la seule recherche vectorielle
 
 
+# --- Analyse des noms de documents : type (NM, NF, ISO...), année, numéro de norme ---
+TYPES_DOCUMENTS = ["NM (Maroc)", "NF / AFNOR", "ISO", "ASTM / DIN / BS", "EN (européenne)", "Guides et autres"]
+_RE_TYPE_NORME = re.compile(r"\b(NM|NF|XP|FD|ISO|ASTM|DIN|BS|EN)\b[\s\-_]*(?:EN|P|ISO|IEC)?[\s\-_]*\d")
+_cache_analyse = {}
+
+
+def analyser_nom_document(chemin: str) -> dict:
+    """Déduit du nom du fichier : type de document, année, numéro de norme (heuristique, pas de lecture du PDF)."""
+    chemin = str(chemin or "")
+    if chemin in _cache_analyse:
+        return _cache_analyse[chemin]
+    nom = chemin.split("/")[-1].rsplit(".", 1)[0]
+    brut = _sans_accents(nom).upper()
+    jetons = {m.group(1) for m in _RE_TYPE_NORME.finditer(brut)}
+    if "NM" in jetons:
+        type_doc = "NM (Maroc)"
+    elif jetons & {"NF", "XP", "FD"}:
+        type_doc = "NF / AFNOR"
+    elif "ISO" in jetons:
+        type_doc = "ISO"
+    elif jetons & {"ASTM", "DIN", "BS"}:
+        type_doc = "ASTM / DIN / BS"
+    elif "EN" in jetons:
+        type_doc = "EN (européenne)"
+    else:
+        type_doc = "Guides et autres"
+    # année : 4 chiffres (1980-2039) qui ne suivent pas directement NM/NF/EN/ISO... (ce serait un numéro de norme)
+    annees = []
+    for m in re.finditer(r"(?<!\d)(19[89]\d|20[0-3]\d)(?!\d)", brut):
+        if re.search(r"\b(?:NM|NF|XP|FD|ISO|ASTM|DIN|BS|EN|P)[\s\-_.]*$", brut[:m.start()]):
+            continue
+        annees.append((m.start(), int(m.group(1))))
+    annee = max((a for _, a in annees), default=None)
+    positions_annees = {pos for pos, _ in annees}
+    ref = None
+    if jetons:
+        m = re.search(r"\bP\s?(\d{2})\s?-\s?(\d{3})(?:-(\d{1,2})(?!\d))?", brut)
+        if m:
+            ref = "P" + "-".join(g for g in m.groups() if g)
+        else:
+            for m in re.finditer(r"(?<!\d)(\d{3,5})((?:-\d{1,2}){0,2})(?!\d)", brut):
+                if m.start() in positions_annees:
+                    continue
+                ref = m.group(1) + m.group(2)
+                break
+    info = {"nom": nom, "type": type_doc, "annee": annee, "ref": ref}
+    _cache_analyse[chemin] = info
+    return info
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def catalogue_documents() -> list:
+    """[(chemin, type, année ou None)] pour les PDF du dépôt Hugging Face."""
+    existants = fichiers_pdf_existants()
+    if not existants:
+        return []
+    sortie = []
+    for chemin in sorted(existants):
+        info = analyser_nom_document(chemin)
+        sortie.append((chemin, info["type"], info["annee"]))
+    return sortie
+
+
+def alertes_editions(chunks: list) -> list:
+    """Messages d'alerte quand une norme citée existe en plusieurs éditions dans la base
+    (ex. NF EN 13808 de 2013 et NM EN 13808 de 2017). Comparaison des noms de fichiers uniquement."""
+    existants = fichiers_pdf_existants()
+    if not existants:
+        return []
+    cites = {}
+    for c in chunks:
+        chemin = _chemin_norm(c)
+        if chemin:
+            cites[chemin] = analyser_nom_document(chemin)
+    par_ref = {}
+    for chemin in existants:
+        info = analyser_nom_document(chemin)
+        if info["ref"]:
+            par_ref.setdefault(info["ref"], []).append((chemin, info))
+
+    def libelle(info):
+        if not info["annee"]:
+            return f"{info['nom']} (année non précisée)"
+        return info["nom"] if str(info["annee"]) in info["nom"] else f"{info['nom']} ({info['annee']})"
+
+    messages, deja = [], set()
+    for chemin, info in cites.items():
+        ref = info["ref"]
+        if not ref or ref in deja or len(par_ref.get(ref, [])) < 2:
+            continue
+        deja.add(ref)
+        groupe = sorted(par_ref[ref], key=lambda x: (x[1]["annee"] or 0, x[0]))
+        cites_ref = [i for ch, i in cites.items() if i["ref"] == ref]
+        annees = [i["annee"] for _, i in groupe if i["annee"]]
+        plus_recente = max(annees) if annees else None
+        ancienne_citee = plus_recente and any(i["annee"] and i["annee"] < plus_recente for i in cites_ref)
+        texte = (f"⚠️ **Plusieurs éditions pour la norme n° {ref}** dans la base : "
+                 + " ; ".join(libelle(i) for _, i in groupe) + ". "
+                 f"Extraits cités issus de : " + ", ".join(libelle(i) for i in cites_ref) + ". ")
+        if ancienne_citee:
+            texte += (f"**Une édition plus récente ({plus_recente}) existe** : cette norme peut avoir été remplacée, "
+                      "vérifiez l'édition en vigueur avant d'appliquer une exigence.")
+        else:
+            texte += "Vérifiez l'édition en vigueur avant d'appliquer une exigence."
+        messages.append(texte)
+    return messages
+
+
 # --- Recherche multi-requêtes + reclassement par l'IA (pertinence : sources compatibles avec la question) ---
 NB_VARIANTES = 2          # reformulations techniques de la question
 RECLASSEMENT_IA = str(st.secrets.get("RECLASSEMENT_IA", "true")).strip().lower() != "false"  # secret = "false" : désactive
@@ -1512,11 +1620,57 @@ def reclasser_llm(question: str, pool: list):
     return retenus[:NB_MAX_RECLASSES], True
 
 
-def rechercher_chunks(question: str, seulement_principales: bool = False):
+@st.cache_data(ttl=3600, max_entries=200, show_spinner=False)
+def _candidats_filtres(question: str, fichiers: tuple):
+    """Recherche vectorielle limitée à une liste de documents (filtres type / année).
+    Filtre étroit : fonction SQL match_documents_fichiers (calcul exact sur le sous-ensemble).
+    Filtre large (>= 40 % des documents) : recherche globale rapide (index) puis filtrage."""
+    autorises = set(fichiers)
+    total = len(fichiers_pdf_existants() or ())
+
+    def via_global():
+        return [c for c in _candidats(question) if _chemin_norm(c) in autorises]
+
+    def via_sql():
+        res = _rpc("match_documents_fichiers", {
+            "query_embedding": _vecteur_question(question),
+            "match_count": NB_CANDIDATS,
+            "fichiers": list(fichiers),
+        })
+        return res.data or []
+
+    ordre = (via_global, via_sql) if total and len(autorises) >= 0.4 * total else (via_sql, via_global)
+    donnees = []
+    for methode in ordre:
+        try:
+            donnees = methode()
+        except Exception:
+            donnees = []
+        if donnees:
+            break
+    if not donnees:
+        raise LookupError("Aucun extrait dans les documents sélectionnés par les filtres.")
+    return sorted(donnees, key=lambda c: c["similarity"], reverse=True)
+
+
+def rechercher_chunks(question: str, seulement_principales: bool = False, fichiers_autorises=None):
     """Recherche vectorielle en deux niveaux : les normes principales sont cherchées à part (et favorisées),
     puis complétées par le reste de la base (sauf en mode « normes principales uniquement »).
     Écarte aussi les normes supprimées de Hugging Face."""
-    generaux = _candidats(question)
+    autorises = fichiers_autorises if fichiers_autorises else None  # frozenset de chemins, ou None = pas de filtre
+    if autorises:
+        liste_autorisee = tuple(sorted(autorises))
+
+        def chercher(q):
+            return _candidats_filtres(q, liste_autorisee)
+    else:
+        chercher = _candidats
+    try:
+        generaux = chercher(question)
+    except LookupError:
+        if not autorises:
+            raise
+        generaux = []
     try:
         variantes = () if _fichiers_cibles(question) else etendre_requete(question)  # document nommé : inutile
     except Exception:
@@ -1525,11 +1679,13 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
         listes = [generaux]
         for v in variantes:
             try:
-                listes.append(_candidats(v))
+                listes.append(chercher(v))
             except Exception:
                 pass
         generaux = _fusionner(listes)[:60]
     principaux = _principales(question, generaux)
+    if autorises:
+        principaux = [c for c in principaux if _chemin_norm(c) in autorises]
     if variantes:
         listes = [principaux]
         for v in variantes:
@@ -1569,6 +1725,8 @@ def rechercher_chunks(question: str, seulement_principales: bool = False):
     existants = fichiers_pdf_existants()
     if existants and layout_coherent():
         candidats = [c for c in candidats if not _chemin_norm(c) or _chemin_norm(c) in existants]
+    if autorises:
+        candidats = [c for c in candidats if _chemin_norm(c) in autorises]  # filtres type / année
     if not candidats:
         return []
 
@@ -1777,6 +1935,105 @@ def ouvrir_visionneuse(cle: str, chemin: str, nom: str, page, extrait: str = "")
     fenetre_visionneuse(chemin, nom or chemin.split("/")[-1], page, " ".join((extrait or "").split())[:300], cle)
 
 
+# --- Retours des utilisateurs (👍 / 👎 + commentaire) enregistrés dans la table « retours » ---
+def _resume_sources(chunks: list) -> list:
+    vus, sortie = set(), []
+    for c in chunks or []:
+        m = c.get("metadata", {})
+        cle = (m.get("chemin") or m.get("fichier"), m.get("page"))
+        if cle in vus:
+            continue
+        vus.add(cle)
+        sortie.append({"fichier": m.get("fichier"), "chemin": m.get("chemin"), "page": m.get("page")})
+        if len(sortie) >= 20:
+            break
+    return sortie
+
+
+def enregistrer_retour(numero: int, question: str, reponse: str, chunks: list, note: int, commentaire: str = "") -> bool:
+    try:
+        supabase.table("retours").upsert({
+            "utilisateur": st.session_state.get("username_courant", ""),
+            "session": st.session_state.get("session_courante", ""),
+            "numero_message": int(numero),
+            "question_md5": hashlib.md5((question or "").encode("utf-8")).hexdigest(),
+            "note": int(note),
+            "question": (question or "")[:2000],
+            "reponse": (reponse or "")[:6000],
+            "commentaire": (commentaire or "")[:1000],
+            "sources": _resume_sources(chunks),
+            "version_app": globals().get("VERSION_APP", ""),
+        }, on_conflict="utilisateur,session,numero_message,question_md5").execute()
+        return True
+    except Exception as e:
+        st.session_state["retour_erreur"] = str(e)[:300]
+        return False
+
+
+def afficher_retour(cle: str, numero: int, question: str, reponse: str, chunks: list):
+    """Pouces sous la réponse ; sur 👎, un champ de commentaire facultatif. Un vote modifié met à jour la ligne."""
+    if not hasattr(st, "feedback"):
+        return
+    st.caption("Cette réponse vous a-t-elle aidé ?")
+    valeur = st.feedback("thumbs", key=f"fb_{cle}")
+    if valeur is None:
+        return
+    note = 1 if valeur == 1 else -1
+    commentaire = ""
+    if note == -1:
+        commentaire = st.text_input("Qu'est-ce qui n'allait pas ? (facultatif, validez avec Entrée)", key=f"fbc_{cle}",
+                                    placeholder="hors sujet, valeur erronée, source absente, trop long...")
+    envoyes = st.session_state.setdefault("retours_envoyes", {})
+    etat = {"note": note, "commentaire": commentaire.strip()}
+    if envoyes.get(cle) != etat:
+        if enregistrer_retour(numero, question, reponse, chunks, note, commentaire.strip()):
+            envoyes[cle] = etat
+            st.toast("Merci pour votre avis 🙏")
+        else:
+            st.caption("⚠️ Avis non enregistré (table « retours » absente ? exécutez le script SQL).")
+
+
+@st.dialog("📊 Retours des utilisateurs", width="large")
+def fenetre_retours():
+    try:
+        lignes = (supabase.table("retours")
+                  .select("cree_le,utilisateur,note,question,commentaire,sources,reponse,version_app")
+                  .order("cree_le", desc=True).limit(500).execute().data or [])
+    except Exception as e:
+        st.error("Table « retours » introuvable : exécutez le script SQL fourni (schema_retours_filtres.sql).")
+        st.caption(str(e)[:200])
+        return
+    if not lignes:
+        st.info("Aucun retour pour le moment.")
+        return
+    pos = sum(1 for l in lignes if l["note"] == 1)
+    neg = len(lignes) - pos
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Retours", len(lignes))
+    c2.metric("👍 Utiles", pos)
+    c3.metric("👎 À améliorer", neg)
+    seulement_neg = st.checkbox("Afficher seulement les 👎", value=True)
+    vue = [l for l in lignes if (l["note"] == -1 or not seulement_neg)]
+    tableau = [{
+        "Date": str(l["cree_le"])[:16].replace("T", " "),
+        "Agent": l["utilisateur"],
+        "Avis": "👍" if l["note"] == 1 else "👎",
+        "Question": l["question"],
+        "Commentaire": l["commentaire"] or "",
+        "Sources": " ; ".join(f"{x.get('fichier')} p.{x.get('page')}" for x in (l.get("sources") or [])[:4]),
+    } for l in vue]
+    st.dataframe(tableau, use_container_width=True, hide_index=True)
+    if vue:
+        choix = st.selectbox("Voir la réponse donnée", range(len(vue)), format_func=lambda i: vue[i]["question"][:90])
+        st.markdown(vue[choix]["reponse"] or "")
+    import csv
+    tampon = io.StringIO()
+    ecrivain = csv.DictWriter(tampon, fieldnames=list(tableau[0].keys()) if tableau else ["Date"])
+    ecrivain.writeheader()
+    ecrivain.writerows(tableau)
+    st.download_button("⬇️ Exporter en CSV", tampon.getvalue().encode("utf-8-sig"), "retours.csv", "text/csv")
+
+
 def afficher_sources(chunks: list, prefixe_cle: str):
     existants = fichiers_pdf_existants()
     verif = bool(existants) and layout_coherent()
@@ -1792,7 +2049,9 @@ def afficher_sources(chunks: list, prefixe_cle: str):
                 continue
             meta = c["metadata"]
             etiquette = "⭐ Norme principale" if c.get("principale") else "Complémentaire"
-            st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} · {etiquette} (pertinence : {c['similarity']:.0%})")
+            info_doc = analyser_nom_document(_chemin_norm(c)) if _chemin_norm(c) else None
+            repere = f" · {info_doc['type']}" + (f" · {info_doc['annee']}" if info_doc and info_doc["annee"] else "") if info_doc else ""
+            st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} · {etiquette}{repere} (pertinence : {c['similarity']:.0%})")
             st.caption(nettoyer_remplissage(c["content"]))
             if peut_visualiser and meta.get("chemin"):
                 if st.button("👁️ Visualiser cette source", key=f"vis_src_{prefixe_cle}_{i}"):
@@ -1801,6 +2060,12 @@ def afficher_sources(chunks: list, prefixe_cle: str):
 
     if nb_retirees:
         st.caption(f"ℹ️ {nb_retirees} extrait(s) cité(s) proviennent de documents retirés de la base : masqués.")
+
+    try:
+        for message in alertes_editions([c for c in chunks if not _supprime(c)]):
+            st.warning(message)
+    except Exception:
+        pass  # l'alerte est un plus : elle ne doit jamais empêcher l'affichage des sources
 
     if not peut_visualiser:
         return
@@ -2081,6 +2346,8 @@ with st.sidebar:
 
     # --- Section Gestion des Utilisateurs (Visible uniquement pour l'admin) ---
     if st.session_state.get("role_utilisateur") == "admin":
+        if st.button("📊 Retours des utilisateurs", use_container_width=True, key="btn_retours"):
+            fenetre_retours()
         with st.expander("👥 Gestion des Utilisateurs"):
             action_user = st.radio("Action", ["Ajouter", "Modifier / Supprimer"], label_visibility="collapsed")
             
@@ -2244,13 +2511,46 @@ with col_bouton:
         sauvegarder_historique()
         st.rerun()
 
+# --- Filtres : type de document et année ---
+fichiers_autorises = None
+_catalogue = catalogue_documents()
+if _catalogue:
+    with st.expander("🎚️ Filtres : type de document et année"):
+        _types_dispo = [t for t in TYPES_DOCUMENTS if any(x[1] == t for x in _catalogue)]
+        _annees = [x[2] for x in _catalogue if x[2]]
+        col_t, col_a = st.columns(2)
+        types_sel = col_t.multiselect("Type de document", _types_dispo, key="filtre_types",
+                                      placeholder="Tous les types")
+        plage = None
+        if _annees and min(_annees) < max(_annees):
+            plage = col_a.slider("Année du document (d'après son nom)", min(_annees), max(_annees),
+                                 (min(_annees), max(_annees)), key="filtre_annees")
+        sans_annee = st.checkbox("Inclure les documents dont le nom n'indique pas d'année", value=True,
+                                 key="filtre_sans_annee")
+        _annee_filtree = bool(plage) and plage != (min(_annees), max(_annees))
+        if types_sel or _annee_filtree or not sans_annee:
+            fichiers_autorises = frozenset(
+                chemin for chemin, type_doc, annee in _catalogue
+                if (not types_sel or type_doc in types_sel)
+                and ((annee is None and sans_annee)
+                     or (annee is not None and (not plage or plage[0] <= annee <= plage[1]))))
+            st.caption(f"🎚️ {len(fichiers_autorises)} document(s) sur {len(_catalogue)} correspondent aux filtres.")
+    if fichiers_autorises is not None:
+        st.caption(f"🎚️ Filtres actifs : {len(fichiers_autorises)} document(s) sur {len(_catalogue)} "
+                   "(ouvrez « Filtres » pour les modifier).")
+if question_vide := (fichiers_autorises is not None and not fichiers_autorises):
+    st.warning("Aucun document ne correspond aux filtres choisis : élargissez les filtres pour pouvoir poser une question.")
+
 for idx, echange in enumerate(historique):
     with st.chat_message("user" if echange["role"] == "user" else "assistant"):
         st.markdown(echange["content"])
         if echange["role"] == "assistant" and echange.get("sources"):
-            afficher_sources(echange["sources"], prefixe_cle=f"{st.session_state.session_courante}_msg{idx}")
+            _cle_msg = f"{st.session_state.session_courante}_msg{idx}"
+            afficher_sources(echange["sources"], prefixe_cle=_cle_msg)
+            afficher_retour(_cle_msg, idx, historique[idx - 1]["content"] if idx > 0 else "",
+                            echange["content"], echange["sources"])
 
-question = st.chat_input("Posez votre question ou enchaînez sur la précédente...")
+question = st.chat_input("Posez votre question ou enchaînez sur la précédente...", disabled=question_vide)
 
 if question:
     historique.append({"role": "user", "content": question})
@@ -2263,7 +2563,7 @@ if question:
             zone_ia = st.empty()
             indicateur_ia(zone_ia, "L'IA analyse les documents", "Recherche vectorielle dans les normes indexées")
             question_recherche = reformuler_question(question, historique[:-1])
-            chunks = rechercher_chunks(question_recherche, seulement_principales)
+            chunks = rechercher_chunks(question_recherche, seulement_principales, fichiers_autorises)
             for _nom, _n in (st.session_state.pop("diag_cibles", None) or {}).items():
                 if _n:
                     st.caption(f"🎯 Document détecté d'après votre question : {_nom} — {_n} extrait(s) retrouvé(s)")
@@ -2290,6 +2590,9 @@ if question:
         if not chunks:
             zone_ia.empty()
             reponse = (
+                "Aucun passage pertinent trouvé dans les documents retenus par vos **filtres** (type / année). "
+                "Élargissez les filtres pour chercher dans plus de documents."
+                if fichiers_autorises is not None else
                 "Aucun passage trouvé dans les **normes principales** pour cette question. "
                 "Décochez « Chercher uniquement dans les normes principales » pour élargir la recherche."
                 if seulement_principales else
@@ -2304,7 +2607,9 @@ if question:
             indicateur_ia(zone_ia, "L'IA rédige la réponse", f"{len(chunks)} extraits sélectionnés · analyse en cours")
             reponse = st.write_stream(flux_avec_indicateur(filtrer_remplissage_flux(flux_reponse(prompt)), zone_ia))  # affichage progressif
             t_generation = time.time() - t1
-            afficher_sources(chunks, prefixe_cle=f"{st.session_state.session_courante}_msg{len(historique)}")
+            _cle_msg = f"{st.session_state.session_courante}_msg{len(historique)}"
+            afficher_sources(chunks, prefixe_cle=_cle_msg)
             st.caption(f"⏱️ Recherche : {t_recherche:.1f} s · Génération de la réponse : {t_generation:.1f} s")
+            afficher_retour(_cle_msg, len(historique), question, reponse, chunks)
             historique.append({"role": "assistant", "content": reponse, "sources": chunks})
             sauvegarder_historique()

@@ -1534,6 +1534,37 @@ def catalogue_documents() -> list:
     return sortie
 
 
+def afficher_filtres():
+    """Filtres type / année dans la barre latérale. Retourne un frozenset de chemins autorisés, ou None (pas de filtre)."""
+    catalogue = catalogue_documents()
+    with st.expander("🎚️ Filtres de recherche"):
+        if not catalogue:
+            st.info("Liste des PDF indisponible pour le moment (dépôt Hugging Face non lu).")
+            if st.button("Réessayer", key="filtres_reessayer"):
+                fichiers_pdf_existants.clear()
+                catalogue_documents.clear()
+                st.rerun()
+            return None
+        types_dispo = [t for t in TYPES_DOCUMENTS if any(x[1] == t for x in catalogue)]
+        annees = [x[2] for x in catalogue if x[2]]
+        types_sel = st.multiselect("Type de document", types_dispo, key="filtre_types", placeholder="Tous les types")
+        plage = None
+        if annees and min(annees) < max(annees):
+            plage = st.slider("Année du document (d'après son nom)", min(annees), max(annees),
+                              (min(annees), max(annees)), key="filtre_annees")
+        sans_annee = st.checkbox("Inclure les documents sans année dans leur nom", value=True, key="filtre_sans_annee")
+        annee_filtree = bool(plage) and plage != (min(annees), max(annees))
+        if not (types_sel or annee_filtree or not sans_annee):
+            st.caption(f"Aucun filtre : les {len(catalogue)} documents sont consultés.")
+            return None
+        autorises = frozenset(
+            chemin for chemin, type_doc, annee in catalogue
+            if (not types_sel or type_doc in types_sel)
+            and ((annee is None and sans_annee) or (annee is not None and (not plage or plage[0] <= annee <= plage[1]))))
+        st.caption(f"🎚️ {len(autorises)} document(s) sur {len(catalogue)} correspondent aux filtres.")
+        return autorises
+
+
 def alertes_editions(chunks: list) -> list:
     """Messages d'alerte quand une norme citée existe en plusieurs éditions dans la base
     (ex. NF EN 13808 de 2013 et NM EN 13808 de 2017). Comparaison des noms de fichiers uniquement."""
@@ -1700,6 +1731,68 @@ def _candidats_filtres(question: str, fichiers: tuple):
     return sorted(donnees, key=lambda c: c["similarity"], reverse=True)
 
 
+# --- Recherche par titre de document : le sens du NOM du fichier rapproche la question du bon document ---
+# (ex. « ajouts de calcaire » -> « NF P 18-508 additif calcaires », même si le texte du PDF emploie d'autres mots)
+NB_DOCS_TITRE = 2
+SEUIL_TITRE = 0.78
+MARGE_TITRE = 0.03
+BONUS_TITRE = 0.02
+
+
+def _titre_lisible(chemin: str) -> str:
+    dossier, _, nom = chemin.rpartition("/")
+    nom = " ".join(nom.rsplit(".", 1)[0].replace("_", " ").split())
+    return f"{nom} ({dossier.split('/')[0]})" if dossier else nom
+
+
+@st.cache_resource(ttl=7200, show_spinner="Préparation de la recherche par titre de document (une seule fois)...")
+def _vecteurs_titres(chemins: tuple):
+    import numpy as np
+    textes = [f"passage: {_titre_lisible(c)}" for c in chemins]
+    return np.asarray(charger_modele().encode(textes, normalize_embeddings=True, batch_size=64,
+                                             show_progress_bar=False), dtype="float32")
+
+
+def documents_proches_titre(question: str, autorises=None) -> list:
+    existants = fichiers_pdf_existants()
+    if not existants:
+        return []
+    import numpy as np
+    chemins = tuple(sorted(existants))
+    sims = _vecteurs_titres(chemins) @ np.asarray(_vecteur_question(question), dtype="float32")
+    retenus, meilleur = [], None
+    for i in np.argsort(-sims)[:40]:
+        if autorises and chemins[i] not in autorises:
+            continue
+        s = float(sims[i])
+        if meilleur is None:
+            if s < SEUIL_TITRE:
+                return []
+            meilleur = s
+        if s < meilleur - MARGE_TITRE or len(retenus) >= NB_DOCS_TITRE:
+            break
+        retenus.append(chemins[i])
+    return retenus
+
+
+def _candidats_documents(question: str, autorises=None) -> list:
+    sortie = []
+    for chemin in documents_proches_titre(question, autorises):
+        try:
+            res = _rpc("match_documents_prefixe", {
+                "query_embedding": _vecteur_question(question),
+                "match_count": 12,
+                "motif": chemin,
+            })
+            lignes = _diversifier(res.data or [], n=5)
+        except Exception:
+            lignes = []
+        for l in lignes:
+            l["titre_proche"] = True
+        sortie += lignes
+    return sortie
+
+
 def rechercher_chunks(question: str, seulement_principales: bool = False, fichiers_autorises=None):
     """Recherche vectorielle en deux niveaux : les normes principales sont cherchées à part (et favorisées),
     puis complétées par le reste de la base (sauf en mode « normes principales uniquement »).
@@ -1768,6 +1861,18 @@ def rechercher_chunks(question: str, seulement_principales: bool = False, fichie
             c["lexical"] = True
             candidats.append(c)
             ajoutes += 1
+
+    # Documents dont le TITRE correspond à la question (sauf si la question nomme déjà un document)
+    try:
+        if not _fichiers_cibles(question):
+            ids_connus = {c.get("id") for c in candidats if c.get("id") is not None}
+            for c in _candidats_documents(question, autorises):
+                if c.get("id") in ids_connus or (seulement_principales and not est_principale(c)):
+                    continue
+                c["similarity"] += BONUS_TITRE
+                candidats.append(c)
+    except Exception:
+        pass  # la recherche par titre est un plus : elle ne doit jamais bloquer la recherche
 
     existants = fichiers_pdf_existants()
     if existants and layout_coherent():
@@ -2110,7 +2215,15 @@ def afficher_sources(chunks: list, prefixe_cle: str):
             st.divider()
 
     if nb_retirees:
-        st.caption(f"ℹ️ {nb_retirees} extrait(s) cité(s) proviennent de documents retirés de la base : masqués.")
+        retires = {}
+        for c in chunks:
+            if _supprime(c):
+                m = c["metadata"]
+                retires[m.get("fichier") or "(nom inconnu)"] = m.get("chemin")
+        st.warning("⚠️ " + str(nb_retirees) + " extrait(s) masqué(s) : le PDF n'existe pas sous le chemin enregistré dans "
+                   "le dépôt Hugging Face — " + " ; ".join(f"**{n}** (chemin : {ch})" for n, ch in retires.items())
+                   + ". Le fichier a été renommé, déplacé ou retiré : réindexez-le (barre latérale : « Tester un "
+                     "fichier » puis « Synchroniser maintenant »).")
 
     try:
         for message in alertes_editions([c for c in chunks if not _supprime(c)]):
@@ -2178,7 +2291,8 @@ if st.session_state.get("historique_charge_pour") != st.session_state.username_c
 historique = st.session_state.sessions[st.session_state.session_courante]
 
 # --- Barre latérale (Sidebar) ---
-VERSION_APP = "v2026.10.19-filtres-retours"
+VERSION_APP = "v2026.10.20-filtres-barre-laterale"
+fichiers_autorises = None  # défini par les filtres de la barre latérale
 with st.sidebar:
     st.caption(f"Version : {VERSION_APP}")
     if os.path.exists("logo lpee.jpg"):
@@ -2217,6 +2331,10 @@ with st.sidebar:
             pass
         time.sleep(0.7)
         st.rerun()
+
+    fichiers_autorises = afficher_filtres()
+    if fichiers_autorises is not None:
+        st.caption(f"🎚️ Filtres actifs ({len(fichiers_autorises)} document(s))")
 
     with st.expander("🔑 Changer mon mot de passe"):
         with st.form("form_mdp", clear_on_submit=True):
@@ -2574,43 +2692,14 @@ with col_bouton:
         sauvegarder_historique()
         st.rerun()
 
-# --- Filtres : type de document et année ---
-fichiers_autorises = None
-_catalogue = catalogue_documents()
-if not _catalogue:
-    with st.expander("🎚️ Filtres : type de document et année"):
-        st.info("Liste des PDF indisponible pour le moment (dépôt Hugging Face non lu). Les filtres s'afficheront "
-                "dès qu'elle sera chargée.")
-        if st.button("Réessayer", key="filtres_reessayer"):
-            fichiers_pdf_existants.clear()
-            catalogue_documents.clear()
-            st.rerun()
-if _catalogue:
-    with st.expander("🎚️ Filtres : type de document et année"):
-        _types_dispo = [t for t in TYPES_DOCUMENTS if any(x[1] == t for x in _catalogue)]
-        _annees = [x[2] for x in _catalogue if x[2]]
-        col_t, col_a = st.columns(2)
-        types_sel = col_t.multiselect("Type de document", _types_dispo, key="filtre_types",
-                                      placeholder="Tous les types")
-        plage = None
-        if _annees and min(_annees) < max(_annees):
-            plage = col_a.slider("Année du document (d'après son nom)", min(_annees), max(_annees),
-                                 (min(_annees), max(_annees)), key="filtre_annees")
-        sans_annee = st.checkbox("Inclure les documents dont le nom n'indique pas d'année", value=True,
-                                 key="filtre_sans_annee")
-        _annee_filtree = bool(plage) and plage != (min(_annees), max(_annees))
-        if types_sel or _annee_filtree or not sans_annee:
-            fichiers_autorises = frozenset(
-                chemin for chemin, type_doc, annee in _catalogue
-                if (not types_sel or type_doc in types_sel)
-                and ((annee is None and sans_annee)
-                     or (annee is not None and (not plage or plage[0] <= annee <= plage[1]))))
-            st.caption(f"🎚️ {len(fichiers_autorises)} document(s) sur {len(_catalogue)} correspondent aux filtres.")
-    if fichiers_autorises is not None:
-        st.caption(f"🎚️ Filtres actifs : {len(fichiers_autorises)} document(s) sur {len(_catalogue)} "
-                   "(ouvrez « Filtres » pour les modifier).")
-if question_vide := (fichiers_autorises is not None and not fichiers_autorises):
-    st.warning("Aucun document ne correspond aux filtres choisis : élargissez les filtres pour pouvoir poser une question.")
+# --- Filtres (réglés dans la barre latérale) : rappel en haut de la conversation ---
+question_vide = fichiers_autorises is not None and not fichiers_autorises
+if question_vide:
+    st.warning("Aucun document ne correspond aux filtres choisis : élargissez-les (barre latérale, « 🎚️ Filtres de "
+               "recherche ») pour pouvoir poser une question.")
+elif fichiers_autorises is not None:
+    st.info(f"🎚️ Filtres actifs : la recherche porte sur {len(fichiers_autorises)} document(s). "
+            "Modifiez-les dans la barre latérale (« 🎚️ Filtres de recherche »).")
 
 for idx, echange in enumerate(historique):
     with st.chat_message("user" if echange["role"] == "user" else "assistant"):

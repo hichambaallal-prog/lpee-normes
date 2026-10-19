@@ -938,11 +938,19 @@ def indexer_pdf(chemin: str, table: str, modele, repo: str, token: str, suivi=No
         suivi["progression"] = f"{nom} — téléchargement depuis Hugging Face"
     local = hf_hub_download(repo_id=repo, filename=chemin, repo_type="dataset", token=token)
     lignes = []
+    nb_vision = 0
     with fitz.open(local) as doc:
         for num, page in enumerate(doc, 1):
             if suivi is not None:
                 suivi["progression"] = f"{nom} — lecture/OCR page {num}/{len(doc)}"
             texte = _texte_page(page)
+            if _vision_indexation_active() and nb_vision < MAX_PAGES_VISION_PAR_DOC and _page_riche(page):
+                if suivi is not None:
+                    suivi["progression"] = f"{nom} — lecture IA des tableaux/schémas page {num}/{len(doc)}"
+                lu = _lire_page_objet(page)
+                if lu:
+                    nb_vision += 1
+                    texte = (texte + "\n\n[Tableaux et schémas lus par IA]\n" + lu).strip()
             if len(texte) < 20:
                 continue
             for idx, morceau in enumerate(_decouper(texte)):
@@ -2042,6 +2050,7 @@ RÈGLES DE PRÉCISION (impératives) :
    précisions possibles.
 9. Termine par « Points non couverts » : 3 puces au maximum, uniquement ce qui manque pour répondre à CETTE
    question (pas la liste des sujets voisins). Si rien d'important ne manque, omets cette section. Ne devine jamais.
+10. Les passages précédés de « [Tableaux et schémas lus par IA] » sont une transcription automatique : utilise-les, mais pour une valeur critique invite l'agent à la vérifier sur la page (bouton « Visualiser »).
 
 FORMAT : commence directement par la réponse (pas d'introduction) ; la réponse à la question d'abord, puis les
 détails par puces ; tableau pour les valeurs ; en dernier, « Points non couverts » s'il y a lieu.
@@ -2170,6 +2179,356 @@ def ouvrir_visionneuse(cle: str, chemin: str, nom: str, page, extrait: str = "")
     fenetre_visionneuse(chemin, nom or chemin.split("/")[-1], page, " ".join((extrait or "").split())[:300], cle)
 
 
+# ==========================================
+# GEMINI VISION (TABLEAUX ET SCHÉMAS) + ASSISTANT DE CONFORMITÉ
+# ==========================================
+# Secrets optionnels :
+#   VISION_INDEXATION = "true"      -> à l'indexation, les pages à tableaux/schémas sont lues par Gemini (coûteux : désactivé par défaut)
+#   MAX_PAGES_VISION_PAR_DOC = "25" -> plafond de pages lues par document à l'indexation
+VISION_INDEXATION = str(st.secrets.get("VISION_INDEXATION", "false")).strip().lower() in ("true", "1", "oui", "yes")
+try:
+    MAX_PAGES_VISION_PAR_DOC = max(1, int(st.secrets.get("MAX_PAGES_VISION_PAR_DOC", 25)))
+except Exception:
+    MAX_PAGES_VISION_PAR_DOC = 25
+
+
+def _generer(contenu, max_tokens: int = 4096, json_sortie: bool = False, reflexion: int = 0, temperature: float = 0.0) -> str:
+    """Appel Gemini avec repli automatique de modèle. 'contenu' = texte ou liste [image/PDF, texte]."""
+    derniere = None
+    for modele in MODELES_GENERATION:
+        cfg = {"temperature": temperature, "max_output_tokens": max_tokens}
+        if json_sortie:
+            cfg["response_mime_type"] = "application/json"
+        if "2.5" in modele:
+            cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=reflexion)
+        try:
+            resp = client.models.generate_content(model=modele, contents=contenu,
+                                                  config=types.GenerateContentConfig(**cfg))
+            if resp.text:
+                return resp.text
+        except Exception as e:
+            derniere = e
+            if _erreur_temporaire(e):
+                time.sleep(2)
+    raise RuntimeError(f"Gemini indisponible : {str(derniere)[:250]}")
+
+
+def _json_depuis_texte(texte: str):
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", (texte or "").strip(), flags=re.M).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        m = re.search(r"[\[{].*[\]}]", t, re.S)
+        if not m:
+            raise ValueError("Réponse de l'IA non exploitable (JSON attendu).")
+        return json.loads(m.group(0))
+
+
+# --- 1) Lecture des tableaux et schémas par Gemini (vision) ---
+PROMPT_VISION = (
+    "Tu analyses l'IMAGE d'une page d'une norme ou d'un document technique (génie civil, géotechnique, routes, "
+    "matériaux). Ta mission : rendre lisibles par un moteur de recherche les éléments que le texte brut perd.\n"
+    "1) TABLEAUX : transcris chacun fidèlement en tableau Markdown (titre du tableau, en-têtes, unités, notes de "
+    "bas de tableau, valeurs EXACTEMENT comme écrites ; répète les cellules fusionnées).\n"
+    "2) SCHÉMAS, FIGURES, COURBES, CROQUIS, ABAQUES : donne le titre ou la légende, ce que la figure représente, "
+    "les éléments annotés, les dimensions et valeurs lisibles, les axes avec leurs unités et la tendance d'une courbe.\n"
+    "3) Ne recopie pas le texte courant. N'invente rien : écris [illisible] quand c'est le cas.\n"
+    "4) Si la page ne contient ni tableau ni schéma, réponds exactement : AUCUN.\n"
+    "Réponds en français, sans introduction."
+)
+
+
+@st.cache_data(ttl=86400, max_entries=200, show_spinner=False)
+def lire_page_gemini(chemin: str, page: int) -> str:
+    """Transcrit les tableaux et décrit les schémas d'une page PDF (à la demande). Les erreurs ne sont pas mises en cache."""
+    import fitz  # PyMuPDF
+    with fitz.open(stream=telecharger_pdf(chemin), filetype="pdf") as doc:
+        p = doc[max(1, min(len(doc), int(page))) - 1]
+        png = p.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), alpha=False).tobytes("png")
+    texte = _generer([types.Part.from_bytes(data=png, mime_type="image/png"), PROMPT_VISION], 4096)
+    return nettoyer_remplissage(texte.strip())
+
+
+def bloc_lecture_vision(cle: str, chemin: str, page):
+    """Bouton « Lire les tableaux et schémas » sous une source ; le résultat reste affiché après les rafraîchissements."""
+    ck = f"vision_{cle}"
+    if st.button("🧠 Lire les tableaux et schémas de cette page (IA)", key=f"btn_{ck}",
+                 help="Gemini regarde la page comme une image : tableaux transcrits, schémas décrits."):
+        with st.spinner("Gemini analyse la page..."):
+            try:
+                st.session_state[ck] = lire_page_gemini(chemin, _entier(page))
+            except Exception as e:
+                st.session_state[ck] = f"⚠️ Lecture impossible : {str(e)[:200]}"
+    if st.session_state.get(ck):
+        st.markdown(st.session_state[ck])
+        st.caption("Transcription automatique par IA : vérifiez les valeurs critiques sur la page "
+                   "(bouton « Visualiser cette source »).")
+
+
+def _vision_indexation_active() -> bool:
+    return VISION_INDEXATION
+
+
+def _page_riche(page) -> bool:
+    """Page contenant un tableau, une image ou beaucoup de tracés vectoriels (schéma)."""
+    try:
+        if page.find_tables().tables:
+            return True
+    except Exception:
+        pass
+    try:
+        if len(page.get_images()) >= 1 or len(page.get_drawings()) >= 30:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _lire_page_objet(page) -> str:
+    """Lecture Gemini d'une page pendant l'indexation. Chaîne vide si rien d'utile ou en cas d'échec."""
+    try:
+        png = page.get_pixmap(dpi=150).tobytes("png")
+        texte = _generer([types.Part.from_bytes(data=png, mime_type="image/png"), PROMPT_VISION], 3000)
+    except Exception:
+        return ""
+    texte = nettoyer_remplissage((texte or "").strip())
+    return "" if (not texte or texte.upper().startswith("AUCUN")) else texte
+
+
+# --- 2) Assistant de conformité ---
+MODE_RECHERCHE = "💬 Recherche dans les normes"
+MODE_CONFORMITE = "✅ Assistant de conformité"
+MAX_PARAMETRES_CONFORMITE = 6
+MAX_EXTRAITS_CONFORMITE = 24
+MAX_OCTETS_FICHIER = 15 * 1024 * 1024
+VERDICTS = {"conforme": "✅ Conforme", "non_conforme": "❌ Non conforme", "indetermine": "❓ Indéterminé"}
+
+PROMPT_EXTRACTION_FICHIER = (
+    "Tu lis un rapport ou procès-verbal d'essai de laboratoire (génie civil, matériaux, géotechnique, routes). "
+    "Transcris TOUS les résultats d'essai, un par ligne, au format :\n"
+    "paramètre | valeur | unité | méthode ou norme d'essai (si indiquée) | échantillon, âge ou conditions (si indiqués)\n"
+    "Inclus aussi, en tête, l'objet de l'essai et la classe ou catégorie visée si le document les mentionne. "
+    "Reprends les valeurs EXACTEMENT comme écrites. N'invente rien ; écris [illisible] si besoin. "
+    "Ne commente pas, n'interprète pas, ne conclus pas sur la conformité."
+)
+
+PROMPT_MESURES = (
+    "Voici des résultats d'essai saisis par un agent de laboratoire :\n\n__RESULTATS__\n\n"
+    "Extrais chaque grandeur mesurée ou caractéristique à vérifier (12 au maximum). Réponds UNIQUEMENT par un "
+    "tableau JSON : [{\"parametre\": \"...\", \"valeur\": \"...\", \"unite\": \"...\", \"methode\": \"...\", "
+    "\"conditions\": \"...\"}]. Garde les valeurs telles qu'écrites (plusieurs éprouvettes ou un intervalle = "
+    "une seule entrée). Champ inconnu = chaîne vide. N'invente rien."
+)
+
+PROMPT_CONFORMITE = """Tu es l'assistant de conformité du LPEE (laboratoire d'essais de matériaux et travaux publics). Tu compares des RÉSULTATS D'ESSAI aux EXIGENCES figurant dans les extraits de normes ci-dessous.
+
+RÈGLES IMPÉRATIVES :
+1. Les exigences viennent UNIQUEMENT des extraits. Aucune connaissance extérieure. Si l'exigence n'y figure pas : verdict "indetermine".
+2. "conforme" seulement si la valeur satisfait EXPLICITEMENT l'exigence (seuil, plage, classe) ; "non_conforme" si elle ne la satisfait pas ; "indetermine" si l'exigence est absente, dépend d'une classe ou d'une condition non précisée, si les unités sont incompatibles ou si la valeur est illisible.
+3. Compare les nombres avec rigueur (≥, ≤, <, >, plages, tolérances, unités). Conversion d'unité seulement si triviale (ex. kPa/MPa), et dis-le.
+4. Cite l'exigence telle qu'écrite (valeur, unité, article ou tableau) et la source (numéro de source).
+5. Si l'exigence varie selon une classe ou une catégorie non précisée par l'agent, donne les cas dans "exigence" et mets "indetermine".
+6. Ne tiens pas compte de l'incertitude de mesure sauf si l'extrait l'impose ; signale dans le commentaire qu'une valeur à moins de 5 % du seuil mérite vérification.
+7. Dans "points_a_verifier", signale : éditions différentes ou contradictoires, passages marqués « lus par IA » (transcription automatique à vérifier sur la page), méthode d'essai de l'agent différente de celle de la norme, informations manquantes pour conclure.
+8. Ne devine jamais. Sois concis.
+
+Réponds UNIQUEMENT par un objet JSON :
+{"synthese": "2 phrases maximum", "criteres": [{"parametre": "...", "valeur_mesuree": "valeur et unité", "exigence": "...", "verdict": "conforme|non_conforme|indetermine", "ecart": "marge ou écart chiffré, sinon vide", "sources": [numéros de source], "commentaire": "..."}], "points_a_verifier": ["..."]}
+
+__ENTREE__
+
+EXTRAITS :
+__EXTRAITS__
+"""
+
+
+def lire_fichier_resultats(nom: str, octets: bytes, mime: str) -> str:
+    """Extrait les résultats d'essai d'un PV (PDF, image ou texte) avec Gemini."""
+    if len(octets) > MAX_OCTETS_FICHIER:
+        raise ValueError("Fichier trop volumineux (15 Mo maximum).")
+    if (mime or "").startswith("text/") or nom.lower().endswith((".txt", ".csv")):
+        return octets.decode("utf-8", errors="replace").strip()
+    if nom.lower().endswith(".pdf"):
+        mime = "application/pdf"
+    elif nom.lower().endswith((".jpg", ".jpeg")):
+        mime = "image/jpeg"
+    elif nom.lower().endswith(".png"):
+        mime = "image/png"
+    return _generer([types.Part.from_bytes(data=octets, mime_type=mime), PROMPT_EXTRACTION_FICHIER], 4096).strip()
+
+
+def extraire_mesures(resultats: str) -> list:
+    brut = _generer(PROMPT_MESURES.replace("__RESULTATS__", resultats[:8000]), 2048, json_sortie=True)
+    data = _json_depuis_texte(brut)
+    if isinstance(data, dict):
+        data = data.get("mesures") or data.get("resultats") or list(data.values())[0]
+    return [m for m in data if isinstance(m, dict) and m.get("parametre")][:12]
+
+
+def _cle_extrait(c) -> tuple:
+    return (c["metadata"].get("fichier"), c["metadata"].get("page"), c["content"][:120])
+
+
+def rassembler_exigences(mesures: list, referentiel: str, contexte: str, seulement_principales, fichiers_autorises) -> list:
+    """Cherche dans la base les exigences pour chaque paramètre mesuré, puis fusionne les extraits."""
+    requetes = []
+    for m in mesures[:MAX_PARAMETRES_CONFORMITE]:
+        requetes.append(" ".join(x for x in (referentiel, m.get("parametre"), m.get("methode"),
+                                             "exigence spécification critère de conformité seuil", contexte) if x))
+    reste = [m.get("parametre", "") for m in mesures[MAX_PARAMETRES_CONFORMITE:]]
+    if reste:
+        requetes.append(" ".join(x for x in (referentiel, " ".join(reste), "exigences spécifications", contexte) if x))
+    groupes, derniere_erreur = [], None
+    for q in requetes:
+        try:
+            groupes.append(rechercher_chunks(q, seulement_principales, fichiers_autorises)[:8])
+        except Exception as e:
+            derniere_erreur = e
+    st.session_state.pop("diag_cibles", None)
+    if not any(groupes):
+        if derniere_erreur:
+            raise derniere_erreur
+        return []
+    fusion, vus = [], set()
+    for rang in range(8):  # tour de rôle entre paramètres : chacun garde ses meilleurs extraits
+        for g in groupes:
+            if rang < len(g) and _cle_extrait(g[rang]) not in vus:
+                vus.add(_cle_extrait(g[rang]))
+                fusion.append(g[rang])
+    return fusion[:MAX_EXTRAITS_CONFORMITE]
+
+
+def verifier_conformite(mesures: list, chunks: list, referentiel: str, contexte: str) -> dict:
+    extraits = "\n\n---\n\n".join(
+        f"[Source {i+1} — {'NORME PRINCIPALE' if c.get('principale') else 'document complémentaire'} — "
+        f"{c['metadata'].get('fichier')}, page {c['metadata'].get('page')}]\n{nettoyer_remplissage(c['content'])}"
+        for i, c in enumerate(chunks))
+    lignes = "\n".join(
+        "- " + " | ".join(str(m.get(k, "")).strip() for k in ("parametre", "valeur", "unite", "methode", "conditions"))
+        for m in mesures)
+    entree = ("RÉSULTATS À VÉRIFIER (paramètre | valeur | unité | méthode | conditions) :\n" + lignes
+              + (f"\nRéférentiel indiqué par l'agent : {referentiel}" if referentiel else "")
+              + (f"\nProduit, classe ou usage visé : {contexte}" if contexte else ""))
+    prompt = PROMPT_CONFORMITE.replace("__ENTREE__", entree).replace("__EXTRAITS__", extraits)
+    data = _json_depuis_texte(_generer(prompt, 6000, json_sortie=True, reflexion=1024))
+    if not isinstance(data, dict) or not isinstance(data.get("criteres"), list):
+        raise ValueError("Réponse de l'IA incomplète : relancez la vérification.")
+    return data
+
+
+def _noms_sources(nums, chunks: list) -> str:
+    if not isinstance(nums, list):
+        nums = [nums]
+    sortie = []
+    for n in nums:
+        try:
+            m = chunks[int(n) - 1]["metadata"]
+            sortie.append(f"{m.get('fichier')} p.{m.get('page')}")
+        except Exception:
+            continue
+    return " ; ".join(sortie)
+
+
+def afficher_conformite(res: dict):
+    data, chunks = res["verdict"], res["chunks"]
+    criteres = data["criteres"]
+    nb = {k: sum(1 for c in criteres if c.get("verdict") == k) for k in VERDICTS}
+    c1, c2, c3 = st.columns(3)
+    c1.metric("✅ Conformes", nb["conforme"])
+    c2.metric("❌ Non conformes", nb["non_conforme"])
+    c3.metric("❓ Indéterminés", nb["indetermine"])
+    if data.get("synthese"):
+        (st.error if nb["non_conforme"] else st.success if nb["conforme"] and not nb["indetermine"] else st.warning)(
+            data["synthese"])
+    tableau = [{
+        "Paramètre": c.get("parametre", ""),
+        "Valeur mesurée": c.get("valeur_mesuree", ""),
+        "Exigence de la norme": c.get("exigence", ""),
+        "Verdict": VERDICTS.get(c.get("verdict"), "❓ Indéterminé"),
+        "Écart / marge": c.get("ecart", ""),
+        "Sources": _noms_sources(c.get("sources", []), chunks),
+        "Commentaire": c.get("commentaire", ""),
+    } for c in criteres]
+    st.dataframe(tableau, use_container_width=True, hide_index=True)
+    if data.get("points_a_verifier"):
+        st.markdown("**⚠️ Points à vérifier**")
+        for p in data["points_a_verifier"]:
+            st.markdown(f"- {p}")
+    st.caption("Aide à la décision : la conclusion doit être validée par le responsable technique, "
+               "sur l'édition de la norme en vigueur.")
+    if tableau:
+        import csv
+        tampon = io.StringIO()
+        w = csv.DictWriter(tampon, fieldnames=list(tableau[0].keys()))
+        w.writeheader()
+        w.writerows(tableau)
+        st.download_button("⬇️ Exporter le tableau (CSV)", tampon.getvalue().encode("utf-8-sig"),
+                           "verification_conformite.csv", "text/csv", key="conf_export_csv")
+    afficher_sources(chunks, prefixe_cle="conf")
+
+
+def page_conformite(fichiers_autorises=None):
+    """Page « Assistant de conformité » : résultats d'essai -> exigences des normes -> verdict par critère."""
+    if EFFETS_IA:
+        st.markdown(CSS_IA, unsafe_allow_html=True)
+        injecter_fond_ia()
+    st.title("✅ Assistant de conformité — LPEE")
+    st.caption("Saisissez (ou chargez) des résultats d'essai : l'assistant retrouve les exigences dans les normes "
+               "indexées et indique, critère par critère, si les résultats sont conformes, non conformes ou "
+               "indéterminés, avec la source de chaque exigence.")
+    if fichiers_autorises is not None and not fichiers_autorises:
+        st.warning("Aucun document ne correspond aux filtres choisis : élargissez-les dans la barre latérale.")
+        return
+    if st.session_state.get("document_cible"):
+        st.info(f"🎯 Exigences cherchées uniquement dans : **{st.session_state['document_cible'].split('/')[-1]}**")
+    elif fichiers_autorises is not None:
+        st.info(f"🎚️ Filtres actifs : exigences cherchées dans {len(fichiers_autorises)} document(s).")
+
+    with st.expander("📄 Charger un PV ou rapport d'essai (PDF, photo, texte)"):
+        fichier = st.file_uploader("Fichier", type=["pdf", "png", "jpg", "jpeg", "txt", "csv"], key="conf_fichier")
+        if fichier is not None and st.button("🧠 Extraire les résultats avec Gemini", key="conf_extraire"):
+            with st.spinner("Gemini lit le document..."):
+                try:
+                    st.session_state["conf_resultats"] = lire_fichier_resultats(fichier.name, fichier.getvalue(), fichier.type)
+                    st.success("Résultats extraits : relisez-les et corrigez-les au besoin ci-dessous.")
+                except Exception as e:
+                    st.error(f"Lecture impossible : {str(e)[:250]}")
+
+    resultats = st.text_area("Résultats d'essai à vérifier", key="conf_resultats", height=170,
+                             placeholder="ex. Béton C25/30 — résistance en compression à 28 j : 31,2 MPa (NM EN 12390-3) ; "
+                                         "affaissement : 90 mm (NM EN 12350-2) ; teneur en air : 4,5 %")
+    c_ref, c_ctx = st.columns(2)
+    referentiel = c_ref.text_input("Norme ou référentiel de comparaison (facultatif)", key="conf_ref",
+                                   placeholder="ex. NF EN 206/CN, NM 10.1.008")
+    contexte = c_ctx.text_input("Produit, classe ou usage visé (facultatif)", key="conf_ctx",
+                                placeholder="ex. béton C25/30 XC2, GNF1 en couche de forme")
+
+    if st.button("✅ Vérifier la conformité", type="primary", disabled=not resultats.strip(), key="conf_lancer"):
+        st.session_state.pop("conf_resultat", None)
+        with st.status("Analyse en cours...", expanded=True) as etat:
+            try:
+                st.write("1/3 · Lecture des résultats saisis")
+                mesures = extraire_mesures(resultats)
+                if not mesures:
+                    raise ValueError("Aucune mesure exploitable détectée : précisez les paramètres et leurs valeurs.")
+                st.write(f"2/3 · Recherche des exigences dans les normes ({len(mesures)} paramètre(s))")
+                chunks = rassembler_exigences(mesures, referentiel.strip(), contexte.strip(),
+                                              st.session_state.get("seulement_principales", False), fichiers_autorises)
+                if not chunks:
+                    raise ValueError("Aucune exigence trouvée dans les documents retenus. Précisez la norme ou élargissez les filtres.")
+                st.write(f"3/3 · Comparaison avec {len(chunks)} extraits de normes")
+                verdict = verifier_conformite(mesures, chunks, referentiel.strip(), contexte.strip())
+                st.session_state["conf_resultat"] = {"verdict": verdict, "chunks": chunks}
+                etat.update(label="Analyse terminée", state="complete", expanded=False)
+            except Exception as e:
+                etat.update(label="Analyse impossible", state="error")
+                st.error(str(e)[:600])
+
+    if st.session_state.get("conf_resultat"):
+        st.markdown("---")
+        afficher_conformite(st.session_state["conf_resultat"])
+
+
 # --- Retours des utilisateurs (👍 / 👎 + commentaire) enregistrés dans la table « retours » ---
 def _resume_sources(chunks: list) -> list:
     vus, sortie = set(), []
@@ -2292,6 +2651,7 @@ def afficher_sources(chunks: list, prefixe_cle: str):
             if peut_visualiser and chemin_src:
                 if st.button("👁️ Visualiser cette source", key=f"vis_src_{prefixe_cle}_{i}"):
                     ouvrir_visionneuse(prefixe_cle, chemin_src, meta.get("fichier"), meta.get("page"), c["content"])
+                bloc_lecture_vision(f"{prefixe_cle}_{i}", chemin_src, meta.get("page"))
             elif peut_visualiser:
                 st.caption("⚠️ Ce document n'est pas retrouvé dans le dépôt Hugging Face (nom différent ou fichier retiré) : "
                            "visualisation et téléchargement impossibles.")
@@ -2415,6 +2775,7 @@ with st.sidebar:
         time.sleep(0.7)
         st.rerun()
 
+    st.radio("Mode", [MODE_RECHERCHE, MODE_CONFORMITE], key="mode_app", label_visibility="collapsed")
     afficher_recherche_reference()
     fichiers_autorises = afficher_filtres()
     if st.session_state.get("document_cible"):
@@ -2747,6 +3108,11 @@ def flux_avec_indicateur(flux, zone):
     if attente:
         zone.empty()
 
+
+# --- Aiguillage : assistant de conformité ---
+if st.session_state.get("mode_app") == MODE_CONFORMITE:
+    page_conformite(fichiers_autorises)
+    st.stop()
 
 # --- Interface Principale ---
 if EFFETS_IA:

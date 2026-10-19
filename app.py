@@ -725,8 +725,37 @@ def _sans_accents(texte: str) -> str:
     return "".join(c for c in t if unicodedata.category(c) != "Mn")
 
 
+def _cle_nom(nom) -> str:
+    """Clé de comparaison d'un nom de fichier : sans dossier, sans extension, sans accents ni ponctuation."""
+    base = str(nom or "").replace("\\", "/").split("/")[-1]
+    if base.lower().endswith(".pdf"):
+        base = base[:-4]
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", _sans_accents(base)).split())
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def index_noms_pdf() -> dict:
+    """{clé du nom -> chemin dans le dépôt Hugging Face}, pour retrouver les extraits indexés sans chemin."""
+    existants = fichiers_pdf_existants()
+    index = {}
+    for chemin in sorted(existants or ()):
+        index.setdefault(_cle_nom(chemin), chemin)
+    return index
+
+
 def _chemin_norm(chunk) -> str:
-    return _norm_chemin(chunk["metadata"].get("chemin"))
+    """Chemin du PDF d'un extrait. Si l'extrait a été indexé sans chemin (anciennes indexations),
+    on le retrouve par le nom du fichier dans le dépôt Hugging Face ; sinon chaîne vide."""
+    meta = chunk["metadata"]
+    chemin = _norm_chemin(meta.get("chemin"))
+    if chemin:
+        return chemin
+    return index_noms_pdf().get(_cle_nom(meta.get("fichier")), "") if meta.get("fichier") else ""
+
+
+def chemin_pour_telechargement(chunk) -> str:
+    """Chemin à utiliser pour télécharger / visualiser le PDF d'un extrait ('' si introuvable)."""
+    return chunk["metadata"].get("chemin") or _chemin_norm(chunk)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -2053,9 +2082,13 @@ def afficher_sources(chunks: list, prefixe_cle: str):
             repere = f" · {info_doc['type']}" + (f" · {info_doc['annee']}" if info_doc and info_doc["annee"] else "") if info_doc else ""
             st.markdown(f"**Source {i} · {meta.get('fichier')}** — page {meta.get('page')} · {etiquette}{repere} (pertinence : {c['similarity']:.0%})")
             st.caption(nettoyer_remplissage(c["content"]))
-            if peut_visualiser and meta.get("chemin"):
+            chemin_src = chemin_pour_telechargement(c)
+            if peut_visualiser and chemin_src:
                 if st.button("👁️ Visualiser cette source", key=f"vis_src_{prefixe_cle}_{i}"):
-                    ouvrir_visionneuse(prefixe_cle, meta["chemin"], meta.get("fichier"), meta.get("page"), c["content"])
+                    ouvrir_visionneuse(prefixe_cle, chemin_src, meta.get("fichier"), meta.get("page"), c["content"])
+            elif peut_visualiser:
+                st.caption("⚠️ Ce document n'est pas retrouvé dans le dépôt Hugging Face (nom différent ou fichier retiré) : "
+                           "visualisation et téléchargement impossibles.")
             st.divider()
 
     if nb_retirees:
@@ -2075,8 +2108,9 @@ def afficher_sources(chunks: list, prefixe_cle: str):
         if _supprime(c):
             continue
         meta = c["metadata"]
-        if meta.get("chemin"):
-            fichiers_uniques[meta["chemin"]] = meta.get("fichier")
+        chemin_doc = chemin_pour_telechargement(c)
+        if chemin_doc:
+            fichiers_uniques[chemin_doc] = meta.get("fichier") or chemin_doc.split("/")[-1]
 
     if fichiers_uniques:
         st.markdown("**📥 Documents sources : visualiser ou télécharger**")

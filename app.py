@@ -743,6 +743,24 @@ def index_noms_pdf() -> dict:
     return index
 
 
+def _resoudre_par_nom(nom) -> str:
+    """Retrouve le PDF du dépôt Hugging Face à partir d'un nom enregistré en base : nom identique, sinon
+    correspondance UNIQUE quand le nom enregistré est le début ou un morceau du nom du fichier (ou l'inverse)."""
+    cle = _cle_nom(nom)
+    if not cle:
+        return ""
+    index = index_noms_pdf()
+    if cle in index:
+        return index[cle]
+    if len(cle) < 6:
+        return ""
+    debuts = [ch for k, ch in index.items() if k.startswith(cle)]
+    if len(debuts) == 1:
+        return debuts[0]
+    morceaux = [ch for k, ch in index.items() if f" {cle} " in f" {k} " or f" {k} " in f" {cle} "]
+    return morceaux[0] if len(morceaux) == 1 else ""
+
+
 def _chemin_norm(chunk) -> str:
     """Chemin du PDF d'un extrait. Si l'extrait a été indexé sans chemin (anciennes indexations),
     on le retrouve par le nom du fichier dans le dépôt Hugging Face ; sinon chaîne vide."""
@@ -750,7 +768,7 @@ def _chemin_norm(chunk) -> str:
     chemin = _norm_chemin(meta.get("chemin"))
     if chemin:
         return chemin
-    return index_noms_pdf().get(_cle_nom(meta.get("fichier")), "") if meta.get("fichier") else ""
+    return _resoudre_par_nom(meta.get("fichier")) if meta.get("fichier") else ""
 
 
 def chemin_pour_telechargement(chunk) -> str:
@@ -2112,6 +2130,17 @@ def afficher_sources(chunks: list, prefixe_cle: str):
         if chemin_doc:
             fichiers_uniques[chemin_doc] = meta.get("fichier") or chemin_doc.split("/")[-1]
 
+    introuvables = {}
+    for c in chunks:
+        if not _supprime(c) and not chemin_pour_telechargement(c):
+            m = c["metadata"]
+            introuvables[m.get("fichier") or "(nom inconnu)"] = m.get("chemin")
+    if introuvables:
+        st.warning("⚠️ Document(s) cité(s) mais introuvable(s) dans le dépôt Hugging Face : "
+                   + ", ".join(f"**{nom}**" for nom in introuvables)
+                   + ". Le nom du PDF a changé depuis l'indexation, ou il a été retiré : "
+                     "réindexez-le (barre latérale : « Tester un fichier » puis « Synchroniser maintenant »).")
+
     if fichiers_uniques:
         st.markdown("**📥 Documents sources : visualiser ou télécharger**")
         for i, (chemin, nom) in enumerate(fichiers_uniques.items()):
@@ -2149,7 +2178,7 @@ if st.session_state.get("historique_charge_pour") != st.session_state.username_c
 historique = st.session_state.sessions[st.session_state.session_courante]
 
 # --- Barre latérale (Sidebar) ---
-VERSION_APP = "v2026.10.14-visionneuse"
+VERSION_APP = "v2026.10.19-filtres-retours"
 with st.sidebar:
     st.caption(f"Version : {VERSION_APP}")
     if os.path.exists("logo lpee.jpg"):
@@ -2548,6 +2577,14 @@ with col_bouton:
 # --- Filtres : type de document et année ---
 fichiers_autorises = None
 _catalogue = catalogue_documents()
+if not _catalogue:
+    with st.expander("🎚️ Filtres : type de document et année"):
+        st.info("Liste des PDF indisponible pour le moment (dépôt Hugging Face non lu). Les filtres s'afficheront "
+                "dès qu'elle sera chargée.")
+        if st.button("Réessayer", key="filtres_reessayer"):
+            fichiers_pdf_existants.clear()
+            catalogue_documents.clear()
+            st.rerun()
 if _catalogue:
     with st.expander("🎚️ Filtres : type de document et année"):
         _types_dispo = [t for t in TYPES_DOCUMENTS if any(x[1] == t for x in _catalogue)]

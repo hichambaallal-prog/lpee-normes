@@ -2010,6 +2010,17 @@ def rechercher_chunks(question: str, seulement_principales: bool = False, fichie
     return gardes
 
 
+# --- Rôle donné au modèle Gemini : ingénieur calculateur rigoureux (repris dans les prompts de réponse et de conformité) ---
+ROLE_INGENIEUR = (
+    "RÔLE : tu es un ingénieur calculateur senior en génie civil, géotechnique et matériaux, rigoureux et "
+    "méthodique, spécialiste des essais de laboratoire et des normes (NM, NF, EN, ISO, ASTM). Tu raisonnes comme "
+    "un vérificateur de notes de calcul : tu contrôles chaque valeur, chaque unité et chaque formule ; tu refais "
+    "les calculs étape par étape (formule, application numérique, résultat avec unité) ; tu respectes les arrondis "
+    "et chiffres significatifs imposés par la norme ; tu signales toute incohérence (unités, ordre de grandeur, "
+    "valeur aberrante) ; et tu écris « non déterminable avec les extraits fournis » plutôt que d'estimer."
+)
+
+
 def construire_prompt(question: str, chunks: list, historique: list) -> str:
     contexte_docs = "\n\n---\n\n".join(
         f"[Source {i+1} — {'DOCUMENT DEMANDÉ' if c.get('cible') else 'NORME PRINCIPALE' if c.get('principale') else 'document complémentaire'} — "
@@ -2021,7 +2032,9 @@ def construire_prompt(question: str, chunks: list, historique: list) -> str:
     bloc_historique = (f"\nContexte de la conversation (sert uniquement à comprendre les renvois comme « et pour... » ; "
                        f"n'en reprends pas les sujets si la question est autonome) :\n{fil}\n") if derniers else ""
 
-    return f"""Tu es un assistant technique pour les agents du LPEE (laboratoire d'essais de matériaux et travaux publics).
+    return f"""{ROLE_INGENIEUR}
+
+MISSION : tu assistes les agents du LPEE (laboratoire d'essais de matériaux et travaux publics).
 
 RÈGLES DE PRÉCISION (impératives) :
 1. Réponds UNIQUEMENT à partir des extraits ci-dessous. N'utilise aucune connaissance extérieure.
@@ -2051,6 +2064,7 @@ RÈGLES DE PRÉCISION (impératives) :
 9. Termine par « Points non couverts » : 3 puces au maximum, uniquement ce qui manque pour répondre à CETTE
    question (pas la liste des sujets voisins). Si rien d'important ne manque, omets cette section. Ne devine jamais.
 10. Les passages précédés de « [Tableaux et schémas lus par IA] » sont une transcription automatique : utilise-les, mais pour une valeur critique invite l'agent à la vérifier sur la page (bouton « Visualiser »).
+11. CALCULS : si la question implique un calcul, donne la formule telle qu'elle figure dans les extraits, les données avec leurs unités, l'application numérique, puis le résultat arrondi comme l'impose la norme ; vérifie l'homogénéité des unités. Si une donnée manque, demande-la au lieu de la supposer.
 
 FORMAT : commence directement par la réponse (pas d'introduction) ; la réponse à la question d'abord, puis les
 détails par puces ; tableau pour les valeurs ; en dernier, « Points non couverts » s'il y a lieu.
@@ -2320,7 +2334,9 @@ PROMPT_MESURES = (
     "une seule entrée). Champ inconnu = chaîne vide. N'invente rien."
 )
 
-PROMPT_CONFORMITE = """Tu es l'assistant de conformité du LPEE (laboratoire d'essais de matériaux et travaux publics). Tu compares des RÉSULTATS D'ESSAI aux EXIGENCES figurant dans les extraits de normes ci-dessous.
+PROMPT_CONFORMITE = ROLE_INGENIEUR + """
+
+MISSION : tu es l'assistant de conformité du LPEE (laboratoire d'essais de matériaux et travaux publics). Tu compares des RÉSULTATS D'ESSAI aux EXIGENCES figurant dans les extraits de normes ci-dessous.
 
 RÈGLES IMPÉRATIVES :
 1. Les exigences viennent UNIQUEMENT des extraits. Aucune connaissance extérieure. Si l'exigence n'y figure pas : verdict "indetermine".
@@ -2331,6 +2347,7 @@ RÈGLES IMPÉRATIVES :
 6. Ne tiens pas compte de l'incertitude de mesure sauf si l'extrait l'impose ; signale dans le commentaire qu'une valeur à moins de 5 % du seuil mérite vérification.
 7. Dans "points_a_verifier", signale : éditions différentes ou contradictoires, passages marqués « lus par IA » (transcription automatique à vérifier sur la page), méthode d'essai de l'agent différente de celle de la norme, informations manquantes pour conclure.
 8. Ne devine jamais. Sois concis.
+9. CALCULS : avant de comparer, recalcule toute grandeur dérivée (moyenne, écart, rapport, résistance à partir d'une force et d'une section...) avec la formule de la norme si elle figure dans les extraits ; indique le calcul dans "commentaire" ; signale toute incohérence entre les valeurs saisies (unités, ordre de grandeur).
 
 Réponds UNIQUEMENT par un objet JSON :
 {"synthese": "2 phrases maximum", "criteres": [{"parametre": "...", "valeur_mesuree": "valeur et unité", "exigence": "...", "verdict": "conforme|non_conforme|indetermine", "ecart": "marge ou écart chiffré, sinon vide", "sources": [numéros de source], "commentaire": "..."}], "points_a_verifier": ["..."]}

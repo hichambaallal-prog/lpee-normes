@@ -1534,6 +1534,73 @@ def catalogue_documents() -> list:
     return sortie
 
 
+# --- Recherche d'une norme par sa référence (barre latérale) ---
+def chercher_par_reference(texte: str, catalogue: list, limite: int = 12):
+    """Documents dont le nom contient tous les termes saisis (« 18-508 », « EN 206 », « NM 10.1.841 »...).
+    Retourne (liste [(chemin, type, année)], nombre total de correspondances)."""
+    jetons = re.findall(r"[a-z0-9]+", _sans_accents(texte))
+    if not jetons:
+        return [], 0
+    cle_requete = " ".join(jetons)
+    trouves = []
+    for chemin, type_doc, annee in catalogue:
+        cle = _cle_nom(chemin)
+        jetons_nom = cle.split()
+        if all(any(f == t or (len(t) >= 3 and f.startswith(t)) for f in jetons_nom) for t in jetons):
+            exact = f" {cle_requete} " in f" {cle} "
+            trouves.append((not exact, -(annee or 0), chemin, type_doc, annee))
+    trouves.sort(key=lambda x: (x[0], x[1], x[2]))
+    return [(c, t, a) for _, _, c, t, a in trouves[:limite]], len(trouves)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def nb_extraits_document(chemin: str):
+    """Nombre d'extraits indexés pour un PDF (None si la base ne répond pas)."""
+    try:
+        table = st.secrets.get("SUPABASE_TABLE", "documents")
+        return supabase.table(table).select("id", count="exact").eq("fichier", chemin).limit(1).execute().count
+    except Exception:
+        return None
+
+
+def afficher_recherche_reference():
+    """Champ « référence de la norme » : trouve le PDF, indique s'il est indexé, permet de le voir ou de limiter
+    les questions à ce seul document."""
+    texte = st.text_input("🔎 Rechercher une norme par sa référence", key="recherche_reference",
+                          placeholder="ex. NF P 18-508, EN 206, 12350-2")
+    cible = st.session_state.get("document_cible")
+    if cible:
+        st.info(f"🎯 Questions limitées à : **{cible.split('/')[-1]}**")
+        if st.button("✖ Retirer cette limitation", key="retirer_cible", use_container_width=True):
+            st.session_state.pop("document_cible", None)
+            st.rerun()
+    if not texte.strip():
+        return
+    catalogue = catalogue_documents()
+    if not catalogue:
+        st.caption("Liste des PDF indisponible pour le moment (dépôt Hugging Face non lu).")
+        return
+    resultats, total = chercher_par_reference(texte, catalogue)
+    if not resultats:
+        st.caption(f"Aucune norme ne correspond à « {texte.strip()} ». Essayez avec le numéro seul (ex. 18-508).")
+        return
+    st.caption(f"{total} document(s) trouvé(s)" + (" — les 12 premiers sont affichés" if total > len(resultats) else ""))
+    for i, (chemin, type_doc, annee) in enumerate(resultats):
+        nom_fichier = chemin.split("/")[-1]
+        n = nb_extraits_document(chemin)
+        etat = f"✅ indexé ({n} extraits)" if n else ("⚠️ non indexé" if n == 0 else "")
+        with st.container(border=True):
+            st.markdown(f"**{nom_fichier.rsplit('.', 1)[0]}**")
+            st.caption(type_doc + (f" · {annee}" if annee else "") + (f" · {etat}" if etat else ""))
+            c_voir, c_cibler = st.columns(2)
+            if c_voir.button("👁️ Voir", key=f"ref_vis_{i}", use_container_width=True):
+                ouvrir_visionneuse(f"ref_{i}", chemin, nom_fichier, 1, "")
+            if c_cibler.button("🎯 Cibler", key=f"ref_cib_{i}", use_container_width=True, disabled=(n == 0),
+                               help="Limiter vos questions à ce seul document"):
+                st.session_state["document_cible"] = chemin
+                st.rerun()
+
+
 def afficher_filtres():
     """Filtres type / année dans la barre latérale. Retourne un frozenset de chemins autorisés, ou None (pas de filtre)."""
     catalogue = catalogue_documents()
@@ -1717,7 +1784,23 @@ def _candidats_filtres(question: str, fichiers: tuple):
         })
         return res.data or []
 
-    ordre = (via_global, via_sql) if total and len(autorises) >= 0.4 * total else (via_sql, via_global)
+    def via_chemins():  # 1 à 5 documents : fonction SQL déjà en place (filtre sur le chemin)
+        lignes = []
+        for chemin in fichiers:
+            res = _rpc("match_documents_prefixe", {
+                "query_embedding": _vecteur_question(question),
+                "match_count": NB_CANDIDATS,
+                "motif": chemin,
+            })
+            lignes += res.data or []
+        return lignes
+
+    if len(autorises) <= 5:
+        ordre = (via_chemins, via_sql, via_global)
+    elif total and len(autorises) >= 0.4 * total:
+        ordre = (via_global, via_sql)
+    else:
+        ordre = (via_sql, via_global)
     donnees = []
     for methode in ordre:
         try:
@@ -2291,7 +2374,7 @@ if st.session_state.get("historique_charge_pour") != st.session_state.username_c
 historique = st.session_state.sessions[st.session_state.session_courante]
 
 # --- Barre latérale (Sidebar) ---
-VERSION_APP = "v2026.10.20-filtres-barre-laterale"
+VERSION_APP = "v2026.10.21-recherche-reference"
 fichiers_autorises = None  # défini par les filtres de la barre latérale
 with st.sidebar:
     st.caption(f"Version : {VERSION_APP}")
@@ -2332,8 +2415,11 @@ with st.sidebar:
         time.sleep(0.7)
         st.rerun()
 
+    afficher_recherche_reference()
     fichiers_autorises = afficher_filtres()
-    if fichiers_autorises is not None:
+    if st.session_state.get("document_cible"):
+        fichiers_autorises = frozenset({st.session_state["document_cible"]})  # le document ciblé l'emporte
+    elif fichiers_autorises is not None:
         st.caption(f"🎚️ Filtres actifs ({len(fichiers_autorises)} document(s))")
 
     with st.expander("🔑 Changer mon mot de passe"):
@@ -2697,6 +2783,9 @@ question_vide = fichiers_autorises is not None and not fichiers_autorises
 if question_vide:
     st.warning("Aucun document ne correspond aux filtres choisis : élargissez-les (barre latérale, « 🎚️ Filtres de "
                "recherche ») pour pouvoir poser une question.")
+elif st.session_state.get("document_cible"):
+    st.info(f"🎯 Vos questions portent uniquement sur **{st.session_state['document_cible'].split('/')[-1]}**. "
+            "Pour revenir à toute la base, cliquez sur « ✖ Retirer cette limitation » dans la barre latérale.")
 elif fichiers_autorises is not None:
     st.info(f"🎚️ Filtres actifs : la recherche porte sur {len(fichiers_autorises)} document(s). "
             "Modifiez-les dans la barre latérale (« 🎚️ Filtres de recherche »).")

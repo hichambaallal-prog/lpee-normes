@@ -2082,6 +2082,7 @@ RÈGLES DE PRÉCISION (impératives) :
    question (pas la liste des sujets voisins). Si rien d'important ne manque, omets cette section. Ne devine jamais.
 10. Les passages précédés de « [Tableaux et schémas lus par IA] » sont une transcription automatique : utilise-les, mais pour une valeur critique invite l'agent à la vérifier sur la page (bouton « Visualiser »).
 11. CALCULS : si la question implique un calcul, donne la formule telle qu'elle figure dans les extraits, les données avec leurs unités, l'application numérique, puis le résultat arrondi comme l'impose la norme ; vérifie l'homogénéité des unités. Si une donnée manque, demande-la au lieu de la supposer.
+12. FORMULES COMPOSÉES : quand le résultat dépend de plusieurs grandeurs (ex. ΔT = R × ΔT_adia), liste chaque grandeur avec sa valeur et sa source (tableau, équation ou donnée de l'agent) et calcule tout ce qui peut l'être. Une valeur lue directement dans un tableau pour les données de l'agent (ex. R pour une épaisseur et un Q41 donnés) se donne avec sa source : ne la déclare jamais « non déterminable ». Ne conclus « non déterminable » que pour la grandeur réellement manquante, en la nommant (ex. « ΔT_adia : équation absente des extraits »), puis écris le résultat final sous forme littérale avec les valeurs connues. N'interpole entre deux valeurs d'un tableau que si la norme le permet, et dis-le. Si un extrait renvoie à une équation ou à un tableau absent des extraits, signale-le et invite l'agent à utiliser le bouton « Lire les tableaux et schémas » sur la page concernée. N'écris jamais « pour les besoins de l'exercice » et ne pose aucune hypothèse que l'agent n'a pas fournie.
 
 FORMAT : commence directement par la réponse (pas d'introduction) ; la réponse à la question d'abord, puis les
 détails par puces ; tableau pour les valeurs ; en dernier, « Points non couverts » s'il y a lieu.
@@ -2263,8 +2264,10 @@ PROMPT_VISION = (
     "bas de tableau, valeurs EXACTEMENT comme écrites ; répète les cellules fusionnées).\n"
     "2) SCHÉMAS, FIGURES, COURBES, CROQUIS, ABAQUES : donne le titre ou la légende, ce que la figure représente, "
     "les éléments annotés, les dimensions et valeurs lisibles, les axes avec leurs unités et la tendance d'une courbe.\n"
-    "3) Ne recopie pas le texte courant. N'invente rien : écris [illisible] quand c'est le cas.\n"
-    "4) Si la page ne contient ni tableau ni schéma, réponds exactement : AUCUN.\n"
+    "3) ÉQUATIONS ET FORMULES : transcris chacune (numéro, expression complète avec tous ses symboles, indices et "
+    "exposants), puis la définition de chaque variable avec son unité et les conditions d'application.\n"
+    "4) Ne recopie pas le texte courant. N'invente rien : écris [illisible] quand c'est le cas.\n"
+    "5) Si la page ne contient ni tableau, ni schéma, ni équation, réponds exactement : AUCUN.\n"
     "Réponds en français, sans introduction."
 )
 

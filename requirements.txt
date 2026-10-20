@@ -10,3 +10,4 @@ streamlit-cookies-controller
 pymupdf
 pytesseract
 pillow
+python-docx

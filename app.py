@@ -2501,6 +2501,7 @@ def afficher_conformite(res: dict):
         w.writerows(tableau)
         st.download_button("⬇️ Exporter le tableau (CSV)", tampon.getvalue().encode("utf-8-sig"),
                            "verification_conformite.csv", "text/csv", key="conf_export_csv")
+    bloc_export_word_conformite(res)
     afficher_sources(chunks, prefixe_cle="conf")
 
 
@@ -2555,7 +2556,8 @@ def page_conformite(fichiers_autorises=None):
                     raise ValueError("Aucune exigence trouvée dans les documents retenus. Précisez la norme ou élargissez les filtres.")
                 st.write(f"3/3 · Comparaison avec {len(chunks)} extraits de normes")
                 verdict = verifier_conformite(mesures, chunks, referentiel.strip(), contexte.strip())
-                st.session_state["conf_resultat"] = {"verdict": verdict, "chunks": chunks}
+                st.session_state["conf_resultat"] = {"verdict": verdict, "chunks": chunks, "mesures": mesures,
+                                                     "referentiel": referentiel.strip(), "contexte": contexte.strip()}
                 etat.update(label="Analyse terminée", state="complete", expanded=False)
             except Exception as e:
                 etat.update(label="Analyse impossible", state="error")
@@ -2564,6 +2566,344 @@ def page_conformite(fichiers_autorises=None):
     if st.session_state.get("conf_resultat"):
         st.markdown("---")
         afficher_conformite(st.session_state["conf_resultat"])
+
+
+# ==========================================
+# EXPORT WORD : NOTE TECHNIQUE AVEC LOGO LPEE
+# ==========================================
+# Nécessite « python-docx » dans requirements.txt. Le logo est lu dans le dossier de l'application
+# (« logo lpee.jpg » ou « logo_lpee.jpg », comme dans la barre latérale).
+COULEUR_NOTE = "1F4E79"
+TYPE_MIME_DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+VERDICTS_WORD = {"conforme": "Conforme", "non_conforme": "Non conforme", "indetermine": "Indéterminé"}
+
+
+def _trouver_logo():
+    for dossier in (os.path.dirname(os.path.abspath(__file__)), os.getcwd()):
+        for nom in ("logo lpee.jpg", "logo_lpee.jpg", "logo lpee.png", "logo_lpee.png"):
+            chemin = os.path.join(dossier, nom)
+            if os.path.exists(chemin):
+                return chemin
+    return None
+
+
+def _ombrer(cellule, couleur: str):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    tc_pr = cellule._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), couleur)
+    tc_pr.append(shd)
+
+
+def _bordure_basse(paragraphe, couleur: str = COULEUR_NOTE):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    p_pr = paragraphe._p.get_or_add_pPr()
+    bordures = OxmlElement("w:pBdr")
+    bas = OxmlElement("w:bottom")
+    for k, v in (("val", "single"), ("sz", "8"), ("space", "4"), ("color", couleur)):
+        bas.set(qn("w:" + k), v)
+    bordures.append(bas)
+    p_pr.append(bordures)
+
+
+def _champ_numero_page(paragraphe, taille=None):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    run = paragraphe.add_run()
+    if taille:
+        run.font.size = taille
+    for typ in ("begin", "instr", "end"):
+        if typ == "instr":
+            el = OxmlElement("w:instrText")
+            el.set(qn("xml:space"), "preserve")
+            el.text = " PAGE "
+        else:
+            el = OxmlElement("w:fldChar")
+            el.set(qn("w:fldCharType"), typ)
+        run._r.append(el)
+
+
+def _texte_riche(paragraphe, texte: str, taille=None, gras: bool = False):
+    """Ajoute du texte avec **gras** Markdown converti en vrai gras Word."""
+    from docx.shared import Pt
+    texte = str(texte or "").replace("`", "")
+    for i, morceau in enumerate(re.split(r"\*\*(.+?)\*\*", texte)):
+        if not morceau:
+            continue
+        run = paragraphe.add_run(morceau)
+        run.bold = gras or (i % 2 == 1)
+        if taille:
+            run.font.size = Pt(taille)
+
+
+def _tableau(doc, entetes: list, lignes: list, taille: float = 9, col_verdict=None, largeurs=None):
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Cm
+    t = doc.add_table(rows=1, cols=len(entetes))
+    t.style = "Table Grid"
+    t.alignment = WD_TABLE_ALIGNMENT.CENTER
+    t.autofit = largeurs is None
+    for j, h in enumerate(entetes):
+        c = t.rows[0].cells[j]
+        _texte_riche(c.paragraphs[0], h, taille, gras=True)
+        _ombrer(c, "D9E2F3")
+    tr_pr = t.rows[0]._tr.get_or_add_trPr()  # ligne d'en-tête répétée d'une page à l'autre
+    rep = OxmlElement("w:tblHeader")
+    rep.set(qn("w:val"), "true")
+    tr_pr.append(rep)
+    for ligne in lignes:
+        cellules = t.add_row().cells
+        for j in range(len(entetes)):
+            txt = str(ligne[j]) if j < len(ligne) else ""
+            _texte_riche(cellules[j].paragraphs[0], txt, taille)
+            if col_verdict is not None and j == col_verdict:
+                bas = txt.lower()
+                _ombrer(cellules[j], "F4B6B6" if "non conforme" in bas else "C6E0B4" if "conforme" in bas else "FFE699")
+    if largeurs:
+        for row in t.rows:
+            for j, w in enumerate(largeurs):
+                row.cells[j].width = Cm(w)
+    doc.add_paragraph().paragraph_format.space_after = 0
+    return t
+
+
+def _markdown_vers_docx(doc, md: str):
+    """Convertit la réponse Markdown du modèle (titres, puces, listes numérotées, tableaux, gras) en mise en page Word."""
+    from docx.shared import Cm
+    lignes, i = (md or "").splitlines(), 0
+    while i < len(lignes):
+        ligne = lignes[i].rstrip()
+        if not ligne.strip():
+            i += 1
+            continue
+        if ligne.lstrip().startswith("|"):
+            bloc = []
+            while i < len(lignes) and lignes[i].lstrip().startswith("|"):
+                bloc.append(lignes[i].strip())
+                i += 1
+            lignes_tab = [[c.strip() for c in l.strip("|").split("|")]
+                          for l in bloc if not re.match(r"^\|?[\s:\-|]+\|?$", l)]
+            if lignes_tab:
+                n = max(len(l) for l in lignes_tab)
+                _tableau(doc, lignes_tab[0] + [""] * (n - len(lignes_tab[0])), lignes_tab[1:], taille=9)
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)", ligne)
+        if m:
+            h = doc.add_heading("", level=min(len(m.group(1)) + 1, 4))
+            _texte_riche(h, m.group(2).replace("**", ""))
+            i += 1
+            continue
+        m = re.match(r"^(\s*)[-*•]\s+(.*)", ligne)
+        if m:
+            p = doc.add_paragraph(style="List Bullet 2" if len(m.group(1)) >= 2 else "List Bullet")
+            _texte_riche(p, m.group(2))
+            p.paragraph_format.space_after = 2
+            i += 1
+            continue
+        m = re.match(r"^\s*(\d+)[.)]\s+(.*)", ligne)
+        if m:
+            p = doc.add_paragraph()
+            p.paragraph_format.left_indent = Cm(0.9)
+            p.paragraph_format.first_line_indent = Cm(-0.6)
+            p.paragraph_format.space_after = 2
+            _texte_riche(p, f"{m.group(1)}.  {m.group(2)}")
+            i += 1
+            continue
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = 4
+        _texte_riche(p, ligne.strip())
+        i += 1
+
+
+def _nouvelle_note(sous_titre: str, infos: list):
+    """Page A4 : en-tête (logo + organisme), titre, tableau d'informations, pied de page numéroté."""
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
+    from docx.shared import Cm, Pt, RGBColor
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(21), Cm(29.7)
+    sec.left_margin = sec.right_margin = Cm(2)
+    sec.top_margin, sec.bottom_margin = Cm(2.6), Cm(2)
+    sec.header_distance, sec.footer_distance = Cm(0.9), Cm(0.8)
+    couleur = RGBColor.from_string(COULEUR_NOTE)
+
+    normal = doc.styles["Normal"]
+    normal.font.name, normal.font.size = "Calibri", Pt(10.5)
+    for n, taille in ((1, 16), (2, 13), (3, 11.5), (4, 10.5)):
+        st_h = doc.styles[f"Heading {n}"]
+        st_h.font.name, st_h.font.size, st_h.font.bold, st_h.font.color.rgb = "Calibri", Pt(taille), True, couleur
+        st_h.paragraph_format.space_before, st_h.paragraph_format.space_after = Pt(10), Pt(4)
+
+    # En-tête : tableau sans bordure (logo à gauche, organisme aligné à droite) puis filet bleu
+    from docx.enum.table import WD_ALIGN_VERTICAL
+    ent = sec.header
+    ent.is_linked_to_previous = False
+    p = ent.paragraphs[0]
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = Pt(2)
+    _bordure_basse(p)
+    tbl = ent.add_table(1, 2, Cm(17))
+    p._p.addprevious(tbl._tbl)  # le tableau passe avant le paragraphe qui porte le filet
+    gauche, droite = tbl.rows[0].cells
+    gauche.width, droite.width = Cm(7), Cm(10)
+    gauche.vertical_alignment = droite.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    logo = _trouver_logo()
+    pg = gauche.paragraphs[0]
+    if logo:
+        try:
+            pg.add_run().add_picture(logo, height=Cm(1.5))
+        except Exception:
+            pass
+    pd_ = droite.paragraphs[0]
+    pd_.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    r = pd_.add_run("Laboratoire Public d'Essais et d'Études")
+    r.bold, r.font.size, r.font.color.rgb = True, Pt(10), couleur
+    r.add_break()
+    r2 = pd_.add_run("Note technique")
+    r2.font.size, r2.font.color.rgb = Pt(9), RGBColor(0x59, 0x59, 0x59)
+
+    # Pied de page
+    pied = sec.footer
+    pied.is_linked_to_previous = False
+    pp = pied.paragraphs[0]
+    pp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    rp = pp.add_run("LPEE — Note établie avec l'assistance d'une IA, à vérifier et valider avant diffusion  ·  Page ")
+    rp.font.size, rp.font.color.rgb = Pt(8), RGBColor(0x7F, 0x7F, 0x7F)
+    _champ_numero_page(pp, Pt(8))
+
+    # Titre
+    t = doc.add_paragraph()
+    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    t.paragraph_format.space_before, t.paragraph_format.space_after = Pt(6), Pt(0)
+    rt = t.add_run("NOTE TECHNIQUE")
+    rt.bold, rt.font.size, rt.font.color.rgb = True, Pt(20), couleur
+    s = doc.add_paragraph()
+    s.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    s.paragraph_format.space_after = Pt(10)
+    rs = s.add_run(sous_titre)
+    rs.italic, rs.font.size = True, Pt(11.5)
+
+    # Tableau d'informations
+    tab = doc.add_table(rows=0, cols=2)
+    tab.style = "Table Grid"
+    for libelle, valeur in infos:
+        if not str(valeur or "").strip():
+            continue
+        cells = tab.add_row().cells
+        _texte_riche(cells[0].paragraphs[0], libelle, 10, gras=True)
+        _ombrer(cells[0], "F2F2F2")
+        _texte_riche(cells[1].paragraphs[0], str(valeur)[:1500], 10)
+        cells[0].width, cells[1].width = Cm(4), Cm(13)
+    doc.add_paragraph()
+    return doc
+
+
+def _finaliser_note(doc, chunks: list, auteur: str) -> bytes:
+    """Sources numérotées (les « Source n » de la réponse), mention IA et bloc de signatures."""
+    from docx.shared import Cm, Pt, RGBColor
+    if chunks:
+        doc.add_heading("Documents sources", level=2)
+        _tableau(doc, ["Source", "Document", "Page"],
+                 [[f"Source {i}", c["metadata"].get("fichier") or "", c["metadata"].get("page") or ""]
+                  for i, c in enumerate(chunks, 1)], taille=9, largeurs=(2.2, 12.3, 2.5))
+    p = doc.add_paragraph()
+    r = p.add_run("Cette note a été générée par un assistant IA à partir des normes et fascicules indexés par le LPEE. "
+                  "Les valeurs et exigences doivent être vérifiées sur la dernière édition en vigueur des documents "
+                  "cités avant toute décision.")
+    r.italic, r.font.size, r.font.color.rgb = True, Pt(8.5), RGBColor(0x59, 0x59, 0x59)
+    sig = doc.add_table(rows=2, cols=3)
+    sig.style = "Table Grid"
+    for j, libelle in enumerate(("Établi par", "Vérifié par", "Approuvé par")):
+        _texte_riche(sig.rows[0].cells[j].paragraphs[0], libelle, 9.5, gras=True)
+        _ombrer(sig.rows[0].cells[j], "D9E2F3")
+    _texte_riche(sig.rows[1].cells[0].paragraphs[0], auteur or "", 9)
+    sig.rows[1].height = Cm(2.2)
+    tampon = io.BytesIO()
+    doc.save(tampon)
+    return tampon.getvalue()
+
+
+def generer_note_recherche(question: str, reponse: str, chunks: list, auteur: str = "") -> bytes:
+    doc = _nouvelle_note("Recherche normative", [
+        ("Objet", question),
+        ("Date", datetime.now().strftime("%d/%m/%Y")),
+        ("Établie par", auteur),
+        ("Nature", "Réponse documentaire assistée par IA, fondée sur les normes et fascicules indexés"),
+    ])
+    doc.add_heading("Réponse", level=2)
+    _markdown_vers_docx(doc, reponse)
+    return _finaliser_note(doc, chunks, auteur)
+
+
+def generer_note_conformite(res: dict, auteur: str = "") -> bytes:
+    data, chunks = res["verdict"], res["chunks"]
+    criteres = data.get("criteres", [])
+    doc = _nouvelle_note("Vérification de conformité de résultats d'essai", [
+        ("Objet", "Comparaison de résultats d'essai aux exigences des normes"),
+        ("Référentiel", res.get("referentiel", "")),
+        ("Produit / classe visée", res.get("contexte", "")),
+        ("Date", datetime.now().strftime("%d/%m/%Y")),
+        ("Établie par", auteur),
+    ])
+    if res.get("mesures"):
+        doc.add_heading("1. Résultats soumis", level=2)
+        _tableau(doc, ["Paramètre", "Valeur", "Unité", "Méthode", "Conditions"],
+                 [[m.get(k, "") for k in ("parametre", "valeur", "unite", "methode", "conditions")]
+                  for m in res["mesures"]], taille=9)
+    nb = {k: sum(1 for c in criteres if c.get("verdict") == k) for k in VERDICTS_WORD}
+    doc.add_heading("2. Synthèse", level=2)
+    p = doc.add_paragraph()
+    _texte_riche(p, f"**{nb['conforme']}** conforme(s) · **{nb['non_conforme']}** non conforme(s) · "
+                    f"**{nb['indetermine']}** indéterminé(s).")
+    if data.get("synthese"):
+        _markdown_vers_docx(doc, data["synthese"])
+    doc.add_heading("3. Vérification critère par critère", level=2)
+    lignes = []
+    for c in criteres:
+        srcs = c.get("sources", [])
+        srcs = srcs if isinstance(srcs, list) else [srcs]
+        detail = " — ".join(x for x in (str(c.get("ecart", "")).strip(), str(c.get("commentaire", "")).strip()) if x)
+        lignes.append([c.get("parametre", ""), c.get("valeur_mesuree", ""), c.get("exigence", ""),
+                       VERDICTS_WORD.get(c.get("verdict"), "Indéterminé"), detail,
+                       ", ".join(f"S{n}" for n in srcs)])
+    _tableau(doc, ["Paramètre", "Valeur mesurée", "Exigence de la norme", "Verdict", "Écart / commentaire", "Sources"],
+             lignes, taille=8.5, col_verdict=3, largeurs=(2.6, 2.4, 4.4, 2.2, 4.2, 1.2))
+    if data.get("points_a_verifier"):
+        doc.add_heading("4. Points à vérifier", level=2)
+        _markdown_vers_docx(doc, "\n".join(f"- {x}" for x in data["points_a_verifier"]))
+    return _finaliser_note(doc, chunks, auteur)
+
+
+def _bouton_word(ck: str, fabriquer, libelle_bouton: str = "📝 Exporter en note Word"):
+    """Bouton « préparer » puis « télécharger » : la note n'est générée qu'au clic."""
+    if st.button(libelle_bouton, key=f"btn_{ck}", help="Note A4 avec le logo LPEE, prête à imprimer ou à signer."):
+        try:
+            st.session_state[ck] = fabriquer()
+        except ImportError:
+            st.error("Module « python-docx » absent : ajoutez-le à requirements.txt puis redéployez l'application.")
+        except Exception as e:
+            st.error(f"Export Word impossible : {str(e)[:250]}")
+    if st.session_state.get(ck):
+        st.download_button("⬇️ Télécharger la note (.docx)", st.session_state[ck],
+                           file_name=f"Note_LPEE_{datetime.now():%Y%m%d_%H%M}.docx",
+                           mime=TYPE_MIME_DOCX, key=f"dl_{ck}")
+
+
+def bloc_export_word(cle: str, question: str, reponse: str, chunks: list):
+    _bouton_word(f"word_{cle}", lambda: generer_note_recherche(
+        question, reponse, chunks, st.session_state.get("nom_utilisateur", "")))
+
+
+def bloc_export_word_conformite(res: dict):
+    _bouton_word("word_conformite", lambda: generer_note_conformite(
+        res, st.session_state.get("nom_utilisateur", "")), "📝 Exporter la vérification en note Word")
 
 
 # --- Retours des utilisateurs (👍 / 👎 + commentaire) enregistrés dans la table « retours » ---
@@ -3201,6 +3541,8 @@ for idx, echange in enumerate(historique):
             afficher_sources(echange["sources"], prefixe_cle=_cle_msg)
             afficher_retour(_cle_msg, idx, historique[idx - 1]["content"] if idx > 0 else "",
                             echange["content"], echange["sources"])
+            bloc_export_word(_cle_msg, historique[idx - 1]["content"] if idx > 0 else "",
+                             echange["content"], echange["sources"])
 
 question = st.chat_input("Posez votre question ou enchaînez sur la précédente...", disabled=question_vide)
 
@@ -3263,5 +3605,6 @@ if question:
             afficher_sources(chunks, prefixe_cle=_cle_msg)
             st.caption(f"⏱️ Recherche : {t_recherche:.1f} s · Génération de la réponse : {t_generation:.1f} s")
             afficher_retour(_cle_msg, len(historique), question, reponse, chunks)
+            bloc_export_word(_cle_msg, question, reponse, chunks)
             historique.append({"role": "assistant", "content": reponse, "sources": chunks})
             sauvegarder_historique()

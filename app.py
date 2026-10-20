@@ -2095,6 +2095,111 @@ QUESTION : {question}
 RÉPONSE :"""
 
 
+# --- Groq (offre gratuite) : modèle de secours quand Gemini est saturé + seconde lecture en conformité ---
+# Secrets : GROQ_API_KEY (clé gratuite sur console.groq.com) ; facultatifs : GROQ_MODELES (liste séparée par des virgules,
+# essayés dans l'ordre) et GROQ_MAX_CAR (taille maximale du prompt envoyé, pour respecter les quotas gratuits).
+GROQ_API_KEY = str(st.secrets.get("GROQ_API_KEY", "")).strip()
+GROQ_MODELES = [m.strip() for m in str(st.secrets.get("GROQ_MODELES", "openai/gpt-oss-120b,llama-3.3-70b-versatile")).split(",") if m.strip()]
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+try:
+    GROQ_MAX_CAR = max(4000, int(st.secrets.get("GROQ_MAX_CAR", 24000)))
+except Exception:
+    GROQ_MAX_CAR = 24000
+
+
+def groq_actif() -> bool:
+    return bool(GROQ_API_KEY)
+
+
+def _reduire_prompt(prompt: str, max_car: int) -> str:
+    """Quotas gratuits serrés : on coupe la fin des extraits (les moins pertinents) en gardant la question."""
+    if len(prompt) <= max_car:
+        return prompt
+    i = prompt.rfind("QUESTION :")
+    queue = prompt[i:] if i != -1 and len(prompt) - i < 4000 else ""
+    return prompt[:max_car - len(queue)] + "\n[... extraits tronqués pour respecter la limite du modèle de secours ...]\n\n" + queue
+
+
+def _groq_corps(prompt: str, modele: str, max_tokens: int, json_sortie: bool, flux: bool) -> dict:
+    corps = {"model": modele, "temperature": 0.1, "max_tokens": max_tokens, "stream": flux,
+             "messages": [{"role": "user", "content": _reduire_prompt(prompt, GROQ_MAX_CAR)}]}
+    if "gpt-oss" in modele:
+        corps["reasoning_effort"] = "low"
+    if json_sortie:
+        corps["response_format"] = {"type": "json_object"}
+    return corps
+
+
+def _groq_flux(prompt: str, max_tokens: int = 4096):
+    """Générateur de texte (streaming) avec repli sur le modèle Groq suivant. Lève RuntimeError si tout échoue."""
+    import requests
+    erreur = None
+    for modele in GROQ_MODELES:
+        emis = False
+        try:
+            with requests.post(GROQ_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, stream=True, timeout=(10, 90),
+                               json=_groq_corps(prompt, modele, max_tokens, False, True)) as r:
+                if r.status_code != 200:
+                    raise RuntimeError(f"Groq {r.status_code} : {r.text[:200]}")
+                r.encoding = "utf-8"
+                for ligne in r.iter_lines(decode_unicode=True):
+                    if not ligne or not ligne.startswith("data:"):
+                        continue
+                    brut = ligne[5:].strip()
+                    if brut == "[DONE]":
+                        break
+                    try:
+                        morceau = json.loads(brut)["choices"][0]["delta"].get("content")
+                    except Exception:
+                        continue
+                    if morceau:
+                        emis = True
+                        yield morceau
+            if emis:
+                return
+        except Exception as e:
+            erreur = e
+            if emis:
+                yield "\n\n⚠️ Réponse interrompue (modèle de secours). Reposez la question pour la compléter."
+                return
+    raise RuntimeError(str(erreur)[:300] if erreur else "réponse vide")
+
+
+def _groq_generer(prompt: str, max_tokens: int = 4096, json_sortie: bool = False) -> str:
+    """Appel Groq sans streaming (texte seul)."""
+    import requests
+    erreur = None
+    for modele in GROQ_MODELES:
+        try:
+            r = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {GROQ_API_KEY}"}, timeout=(10, 90),
+                              json=_groq_corps(prompt, modele, max_tokens, json_sortie, False))
+            if r.status_code != 200:
+                raise RuntimeError(f"Groq {r.status_code} : {r.text[:200]}")
+            texte = r.json()["choices"][0]["message"].get("content") or ""
+            if texte.strip():
+                return texte
+        except Exception as e:
+            erreur = e
+    raise RuntimeError(f"Groq indisponible : {str(erreur)[:250]}")
+
+
+def comparer_verdicts(v1: dict, v2: dict) -> list:
+    """Désaccords entre deux lectures de conformité, appariées par nom de paramètre."""
+    def cle(p):
+        return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", str(p or "").lower()).encode("ascii", "ignore").decode())
+    autre = {cle(c.get("parametre")): c for c in v2.get("criteres", [])}
+    sortie = []
+    for c in v1.get("criteres", []):
+        d = autre.get(cle(c.get("parametre")))
+        if d is None:
+            sortie.append({"Paramètre": c.get("parametre", ""), "Gemini": VERDICTS.get(c.get("verdict"), "?"),
+                           "Seconde lecture": "Non évalué"})
+        elif d.get("verdict") != c.get("verdict"):
+            sortie.append({"Paramètre": c.get("parametre", ""), "Gemini": VERDICTS.get(c.get("verdict"), "?"),
+                           "Seconde lecture": VERDICTS.get(d.get("verdict"), "?")})
+    return sortie
+
+
 def flux_reponse(prompt: str):
     """Générateur : affiche la réponse au fur et à mesure (1er mot en ~1 s) avec repli automatique de modèle."""
     derniere_erreur = None
@@ -2116,6 +2221,18 @@ def flux_reponse(prompt: str):
                 return
             if _erreur_temporaire(e):
                 time.sleep(2)
+    if groq_actif():
+        try:
+            premier = True
+            for morceau in _groq_flux(prompt):
+                if premier:
+                    premier = False
+                    yield ("ℹ️ Gemini est saturé : réponse générée par le modèle de secours (Groq, gratuit). "
+                           "Vérifiez les valeurs critiques.\n\n")
+                yield morceau
+            return
+        except Exception as e:
+            derniere_erreur = f"{derniere_erreur} | secours Groq : {e}"
     yield (
         "⚠️ Le service Gemini est momentanément saturé (côté Google). Les documents trouvés sont listés "
         "ci-dessous ; réessayez dans une minute.\n\n"
@@ -2242,6 +2359,11 @@ def _generer(contenu, max_tokens: int = 4096, json_sortie: bool = False, reflexi
             derniere = e
             if _erreur_temporaire(e):
                 time.sleep(2)
+    if groq_actif() and isinstance(contenu, str):  # texte seul : le modèle de secours ne lit pas les images
+        try:
+            return _groq_generer(contenu, max_tokens, json_sortie)
+        except Exception as e:
+            derniere = f"{derniere} | {e}"
     raise RuntimeError(f"Gemini indisponible : {str(derniere)[:250]}")
 
 
@@ -2435,7 +2557,7 @@ def rassembler_exigences(mesures: list, referentiel: str, contexte: str, seuleme
     return fusion[:MAX_EXTRAITS_CONFORMITE]
 
 
-def verifier_conformite(mesures: list, chunks: list, referentiel: str, contexte: str) -> dict:
+def verifier_conformite(mesures: list, chunks: list, referentiel: str, contexte: str, moteur: str = "gemini") -> dict:
     extraits = "\n\n---\n\n".join(
         f"[Source {i+1} — {'NORME PRINCIPALE' if c.get('principale') else 'document complémentaire'} — "
         f"{c['metadata'].get('fichier')}, page {c['metadata'].get('page')}]\n{nettoyer_remplissage(c['content'])}"
@@ -2447,7 +2569,9 @@ def verifier_conformite(mesures: list, chunks: list, referentiel: str, contexte:
               + (f"\nRéférentiel indiqué par l'agent : {referentiel}" if referentiel else "")
               + (f"\nProduit, classe ou usage visé : {contexte}" if contexte else ""))
     prompt = PROMPT_CONFORMITE.replace("__ENTREE__", entree).replace("__EXTRAITS__", extraits)
-    data = _json_depuis_texte(_generer(prompt, 6000, json_sortie=True, reflexion=1024))
+    brut = (_groq_generer(prompt, 6000, True) if moteur == "groq"
+            else _generer(prompt, 6000, json_sortie=True, reflexion=1024))
+    data = _json_depuis_texte(brut)
     if not isinstance(data, dict) or not isinstance(data.get("criteres"), list):
         raise ValueError("Réponse de l'IA incomplète : relancez la vérification.")
     return data
@@ -2487,6 +2611,14 @@ def afficher_conformite(res: dict):
         "Commentaire": c.get("commentaire", ""),
     } for c in criteres]
     st.dataframe(tableau, use_container_width=True, hide_index=True)
+    if res.get("verdict_2"):
+        ecarts = comparer_verdicts(data, res["verdict_2"])
+        if ecarts:
+            st.warning(f"🔍 Seconde lecture : {len(ecarts)} désaccord(s) entre les deux modèles. "
+                       "Vérifiez ces critères à la main.")
+            st.dataframe(ecarts, use_container_width=True, hide_index=True)
+        else:
+            st.success("🔍 Seconde lecture : les deux modèles aboutissent aux mêmes verdicts.")
     if data.get("points_a_verifier"):
         st.markdown("**⚠️ Points à vérifier**")
         for p in data["points_a_verifier"]:
@@ -2541,6 +2673,10 @@ def page_conformite(fichiers_autorises=None):
     contexte = c_ctx.text_input("Produit, classe ou usage visé (facultatif)", key="conf_ctx",
                                 placeholder="ex. béton C25/30 XC2, GNF1 en couche de forme")
 
+    seconde = False
+    if groq_actif():
+        seconde = st.checkbox("Seconde lecture par un autre modèle (Groq, gratuit) : signale les désaccords",
+                              key="conf_seconde")
     if st.button("✅ Vérifier la conformité", type="primary", disabled=not resultats.strip(), key="conf_lancer"):
         st.session_state.pop("conf_resultat", None)
         with st.status("Analyse en cours...", expanded=True) as etat:
@@ -2556,8 +2692,16 @@ def page_conformite(fichiers_autorises=None):
                     raise ValueError("Aucune exigence trouvée dans les documents retenus. Précisez la norme ou élargissez les filtres.")
                 st.write(f"3/3 · Comparaison avec {len(chunks)} extraits de normes")
                 verdict = verifier_conformite(mesures, chunks, referentiel.strip(), contexte.strip())
+                verdict2 = None
+                if seconde and groq_actif():
+                    st.write("Seconde lecture (Groq)...")
+                    try:
+                        verdict2 = verifier_conformite(mesures, chunks, referentiel.strip(), contexte.strip(), moteur="groq")
+                    except Exception as e:
+                        st.warning(f"Seconde lecture indisponible : {str(e)[:200]}")
                 st.session_state["conf_resultat"] = {"verdict": verdict, "chunks": chunks, "mesures": mesures,
-                                                     "referentiel": referentiel.strip(), "contexte": contexte.strip()}
+                                                     "referentiel": referentiel.strip(), "contexte": contexte.strip(),
+                                                     "verdict_2": verdict2}
                 etat.update(label="Analyse terminée", state="complete", expanded=False)
             except Exception as e:
                 etat.update(label="Analyse impossible", state="error")
